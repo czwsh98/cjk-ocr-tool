@@ -8,7 +8,7 @@ A local web app that extracts and optionally translates Japanese and Chinese doc
 
 ## Features
 
-- **OCR** scanned Japanese and Chinese PDFs via Gemini Vision (handles vertical text, furigana, bopomofo)
+- **OCR** scanned Japanese, Korean, and Chinese PDFs via Gemini Vision (handles vertical text, furigana, bopomofo)
 - **Direct text extraction** from machine-readable PDFs (no OCR needed)
 - **TXT file support** — feed in pre-extracted text and go straight to translation
 - **Translation** to English or Traditional Chinese, powered by the same Gemini API
