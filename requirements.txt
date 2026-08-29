@@ -14,3 +14,7 @@ python-docx>=1.1.0
 
 # Vision OCR — default provider in ocr_client.py (Google Gen AI SDK)
 google-genai>=1.0.0
+
+# Imported directly by ocr_client.py to retry Gemini network/timeout errors.
+# Ships as a google-genai dependency, but declare it since we import it.
+httpx>=0.27.0

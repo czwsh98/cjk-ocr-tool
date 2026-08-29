@@ -67,6 +67,10 @@ class ModelResult:
     model: str
     input_tokens: int = 0
     output_tokens: int = 0
+    # Subset of input_tokens served from the provider's prompt cache. Both
+    # providers bill these far below the cache-miss rate (DeepSeek $0.007 vs
+    # $0.22 per 1M), so cost estimates must account for them separately.
+    cached_input_tokens: int = 0
 
 
 def postprocess_translation_ready_text(text: str) -> str:
@@ -183,6 +187,7 @@ def _gemini_text(contents: list, *, model: str) -> ModelResult:
                 model=model,
                 input_tokens=int(getattr(usage, "prompt_token_count", 0) or 0),
                 output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0),
+                cached_input_tokens=int(getattr(usage, "cached_content_token_count", 0) or 0),
             )
         except (genai_errors.ServerError, genai_errors.ClientError, httpx.NetworkError, httpx.TimeoutException) as e:
             code = getattr(e, "status_code", None) or getattr(e, "code", None)
@@ -196,13 +201,27 @@ def _gemini_text(contents: list, *, model: str) -> ModelResult:
     raise last_exc  # type: ignore[misc]
 
 
+# Gemini 2.5 is deliberately not a default here. Benchmarked on scanned CJK
+# pages, gemini-2.5-flash-lite substitutes characters (女→站, 购→敛), emits
+# halfwidth commas in CJK runs, and simplifies Japanese kanji (書→书) against
+# rule 5 of VISION_PROMPT_OCR; on translation it left a chapter heading in
+# untranslated Japanese. gemini-3.1-flash-lite is both cheaper and more
+# accurate than gemini-2.5-flash, so the old quality tier has no niche left.
+_GEMINI_FALLBACKS = {
+    ("ocr", "economy"): "gemini-3.1-flash-lite",
+    ("ocr", "quality"): "gemini-3.5-flash-lite",
+    ("translation", "economy"): "gemini-3.1-flash-lite",
+    ("translation", "quality"): "gemini-3.7-flash",
+}
+
+
 def _gemini_model(kind: str, quality: str) -> str:
     if kind == "ocr":
         key = "GEMINI_OCR_QUALITY_MODEL" if quality == "quality" else "GEMINI_OCR_MODEL"
     else:
         key = "GEMINI_TRANSLATION_QUALITY_MODEL" if quality == "quality" else "GEMINI_TRANSLATION_MODEL"
-    fallback = "gemini-2.5-flash" if quality == "quality" else "gemini-2.5-flash-lite"
-    return os.environ.get(key, fallback)
+    tier = "quality" if quality == "quality" else "economy"
+    return os.environ.get(key) or _GEMINI_FALLBACKS[(kind, tier)]
 
 
 def ocr_image(image_path: Path, *, quality: str = "economy") -> ModelResult:
@@ -257,6 +276,7 @@ def _deepseek_text(prompt: str) -> ModelResult:
                 model=model,
                 input_tokens=int(usage.get("prompt_tokens") or 0),
                 output_tokens=int(usage.get("completion_tokens") or 0),
+                cached_input_tokens=int(usage.get("prompt_cache_hit_tokens") or 0),
             )
         except urllib.error.HTTPError as exc:
             if exc.code in _RETRYABLE_CODES and attempt < len(_RETRY_DELAYS):
@@ -272,14 +292,28 @@ def _deepseek_text(prompt: str) -> ModelResult:
     raise last_exc or RuntimeError("DeepSeek API request failed.")
 
 
+def default_translation_provider() -> str:
+    """
+    DeepSeek when configured, else Gemini.
+
+    On a Japanese->Traditional Chinese benchmark deepseek-v4-flash was both the
+    cheapest option tested ($0.000098 vs $0.000207 for gemini-3.1-flash-lite)
+    and the most faithful, so it is preferred whenever a key is present.
+    """
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        return "deepseek"
+    return "gemini"
+
+
 def translate_text(
     text: str,
     target: str,
     *,
-    provider: str = "gemini",
+    provider: str | None = None,
     quality: str = "economy",
 ) -> ModelResult:
     """Translate Japanese text to English or Traditional Chinese."""
+    provider = provider or default_translation_provider()
     if not text.strip():
         return ModelResult("", provider, "")
     if target not in {"en", "zh"}:

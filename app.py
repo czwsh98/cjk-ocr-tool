@@ -18,7 +18,12 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 
 from exporters import PageResult, write_docx, write_markdown
-from ocr_client import ocr_image, postprocess_translation_ready_text, translate_text
+from ocr_client import (
+    default_translation_provider,
+    ocr_image,
+    postprocess_translation_ready_text,
+    translate_text,
+)
 from pdf_processor import extract_pdf_page_text, pdf_page_count, pdf_page_to_image
 from range_utils import parse_page_range
 
@@ -107,33 +112,71 @@ def _record_usage(job_id: str, result) -> None:
             job["models"].append(result.model)
 
 
+# USD per 1M tokens as (cache-miss input, output, cache-hit input).
+# Gemini 3.6/3.7 input, output and cache rates are promotional through
+# 2026-12-31; from 2027-01-01 the cached rate doubles to 0.15.
+_GEMINI_PRICES = {
+    "gemini-2.5-flash-lite": (0.10, 0.40, 0.01),
+    "gemini-2.5-flash": (0.30, 2.50, 0.03),
+    "gemini-3.1-flash-lite": (0.25, 1.50, 0.025),
+    "gemini-3.5-flash-lite": (0.30, 2.50, 0.03),
+    "gemini-3.5-flash": (1.50, 9.00, 0.15),
+    "gemini-3.6-flash": (0.75, 3.75, 0.075),
+    "gemini-3.7-flash": (0.75, 3.75, 0.075),
+}
+
+# DeepSeek publishes one rate card per model with a 50% off-peak discount, so
+# only the peak column is stored and halved outside peak hours.
+_DEEPSEEK_PEAK_PRICES = {
+    "deepseek-v4-flash": (0.44, 1.32, 0.014),
+    "deepseek-v4-flash-vision-exp": (0.44, 1.32, 0.014),
+    "deepseek-v4-pro": (1.32, 3.96, 0.044),
+}
+
+
+def _deepseek_is_peak(now: datetime) -> bool:
+    """Peak is 01:00-04:00 and 06:00-10:00 UTC, Monday through Friday."""
+    return now.weekday() < 5 and (1 <= now.hour < 4 or 6 <= now.hour < 10)
+
+
+def _model_prices(result) -> tuple[float, float, float] | None:
+    model_id = (result.model or "").rsplit("/", 1)[-1]
+    if model_id in _GEMINI_PRICES:
+        return _GEMINI_PRICES[model_id]
+    peak_price = _DEEPSEEK_PEAK_PRICES.get(model_id)
+    if peak_price is not None:
+        if _deepseek_is_peak(datetime.now(timezone.utc)):
+            return peak_price
+        return tuple(value / 2 for value in peak_price)  # type: ignore[return-value]
+
+    provider_prefix = "GEMINI" if result.provider == "gemini" else "DEEPSEEK"
+    input_override = os.environ.get(f"{provider_prefix}_INPUT_PRICE_USD_PER_MILLION")
+    output_override = os.environ.get(f"{provider_prefix}_OUTPUT_PRICE_USD_PER_MILLION")
+    if input_override is None or output_override is None:
+        return None
+    try:
+        # Without a published cache rate for an unknown model, bill cached
+        # tokens at the full input rate so the estimate never reads low.
+        return (float(input_override), float(output_override), float(input_override))
+    except ValueError:
+        return None
+
+
 def _estimate_cost(result) -> float | None:
     """Estimate standard token cost; DeepSeek follows the call's UTC rate window."""
-    prices = {
-        "gemini-2.5-flash-lite": (0.10, 0.40),
-        "gemini-2.5-flash": (0.30, 2.50),
-        "gemini-3.1-flash-lite": (0.25, 1.50),
-        "gemini-3.5-flash-lite": (0.30, 2.50),
-        "gemini-3.7-flash": (0.75, 3.75),
-    }
-    model_id = (result.model or "").rsplit("/", 1)[-1]
-    if model_id == "deepseek-v4-flash":
-        now = datetime.now(timezone.utc)
-        peak = now.weekday() < 5 and (1 <= now.hour < 4 or 6 <= now.hour < 10)
-        prices[model_id] = (0.44, 1.32) if peak else (0.22, 0.66)
-    price = prices.get(model_id)
+    price = _model_prices(result)
     if price is None:
-        provider_prefix = "GEMINI" if result.provider == "gemini" else "DEEPSEEK"
-        input_override = os.environ.get(f"{provider_prefix}_INPUT_PRICE_USD_PER_MILLION")
-        output_override = os.environ.get(f"{provider_prefix}_OUTPUT_PRICE_USD_PER_MILLION")
-        if input_override is None or output_override is None:
-            return None
-        try:
-            price = (float(input_override), float(output_override))
-        except ValueError:
-            return None
-    input_price, output_price = price
-    return (result.input_tokens * input_price + result.output_tokens * output_price) / 1_000_000
+        return None
+    input_price, output_price, cached_price = price
+    # Providers report cache hits as a subset of the total prompt tokens, and
+    # bill them at a small fraction of the cache-miss rate.
+    cached_tokens = max(0, min(result.cached_input_tokens, result.input_tokens))
+    billed_input_tokens = result.input_tokens - cached_tokens
+    return (
+        billed_input_tokens * input_price
+        + cached_tokens * cached_price
+        + result.output_tokens * output_price
+    ) / 1_000_000
 
 
 def _translation_chunks(text: str, max_chars: int = TRANSLATION_CHUNK_CHARS) -> list[str]:
@@ -359,7 +402,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="grid">
           <div class="field pdf-only" id="rangeField"><label for="pageRange">页码范围</label><input id="pageRange" type="text" value="all" placeholder="all 或 1-5, 8, 12-18"><small>只处理指定页面，减少时间与 API 费用。</small></div>
           <div class="field pdf-only" id="ocrField"><label for="ocrSetting">PDF 文字识别</label><select id="ocrSetting"><option value="auto">自动：优先读取已有文字</option><option value="always">始终使用 OCR</option><option value="never">永不 OCR</option></select><small>自动模式只对没有足够文本的扫描页调用 Vision API。</small></div>
-          <div class="field"><label>质量</label><div class="choices"><label class="choice"><input type="radio" name="quality" value="economy" checked><span>经济</span></label><label class="choice"><input type="radio" name="quality" value="quality"><span>高质量</span></label></div><small>经济使用 Gemini Flash-Lite；高质量使用 Gemini Flash。</small></div>
+          <div class="field"><label>质量</label><div class="choices"><label class="choice"><input type="radio" name="quality" value="economy" checked><span>经济</span></label><label class="choice"><input type="radio" name="quality" value="quality"><span>高质量</span></label></div><small>经济使用 Gemini 3.1 Flash-Lite；高质量 OCR 使用 3.5 Flash-Lite，翻译使用 3.7 Flash。</small></div>
           <div class="field translation-only" id="targetField"><label>翻译为</label><div class="choices"><label class="choice"><input type="radio" name="target" value="zh" checked><span>繁体中文</span></label><label class="choice"><input type="radio" name="target" value="en"><span>English</span></label></div></div>
           <div class="field translation-only" id="providerField"><label for="provider">翻译服务</label><select id="provider"><option value="gemini">Gemini</option></select><small id="providerHelp">按服务器已配置的 API 显示。</small></div>
           <div class="field translation-only" id="translationOutputField"><label>翻译输出</label><div class="choices"><label class="choice"><input type="radio" name="translationOutput" value="translation" checked><span>仅译文</span></label><label class="choice"><input type="radio" name="translationOutput" value="bilingual"><span>原文＋译文</span></label></div></div>
@@ -386,7 +429,7 @@ function checked(name){return document.querySelector(`input[name="${name}"]:chec
 function showError(message){errorBox.textContent=message;errorBox.classList.add('show')}
 function stageLabel(stage){if(stage==='queued')return'排队等待中';if(stage==='preparing')return'正在检查文件';if(stage==='extracting')return'开始提取文字';if(stage.startsWith('extracting_page_'))return`正在提取第 ${stage.split('_').pop()} 页`;if(stage==='translating')return'开始翻译';if(stage.startsWith('translating_page_'))return`正在翻译第 ${stage.split('_').pop()} 页`;if(stage==='done')return'处理完成';return stage||'等待中'}
 
-async function loadConfig(){try{const r=await fetch('/api/config');const c=await r.json();if(c.deepseek){const o=document.createElement('option');o.value='deepseek';o.textContent='DeepSeek V4 Flash';$('#provider').appendChild(o)}else{$('#providerHelp').textContent='未配置 DeepSeek key，目前使用 Gemini。'}}catch{}}
+async function loadConfig(){try{const r=await fetch('/api/config');const c=await r.json();if(c.deepseek){const o=document.createElement('option');o.value='deepseek';o.textContent='DeepSeek V4 Flash';$('#provider').prepend(o);$('#providerHelp').textContent='DeepSeek 更便宜且译文更忠实，默认使用。'}else{$('#providerHelp').textContent='未配置 DeepSeek key，目前使用 Gemini。'}if(c.default_translation_provider)$('#provider').value=c.default_translation_provider}catch{}}
 loadConfig();
 
 $('#start').onclick=async()=>{if(!selectedFile)return;const formats=$$('input[name="format"]:checked').map(x=>x.value);if(!formats.length){showError('至少选择一种导出格式。');return}errorBox.classList.remove('show');$('#start').disabled=true;progress.classList.add('show');$('#preview').textContent='';$$('.downloads a').forEach(x=>x.classList.remove('show'));const fd=new FormData();fd.append('file',selectedFile);fd.append('mode',mode);fd.append('page_range',$('#pageRange').value||'all');fd.append('ocr_setting',$('#ocrSetting').value);fd.append('target',checked('target')||'zh');fd.append('translation_provider',$('#provider').value);fd.append('quality',checked('quality'));fd.append('translation_output',checked('translationOutput')||'translation');fd.append('output_formats',formats.join(','));try{const r=await fetch('/api/jobs',{method:'POST',body:fd});const data=await r.json();if(!r.ok)throw new Error(data.detail||'无法创建任务');poll(data.job_id)}catch(e){showError(e.message);$('#start').disabled=false}};
@@ -431,6 +474,7 @@ def config() -> dict:
     return {
         "gemini": bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")),
         "deepseek": bool(os.environ.get("DEEPSEEK_API_KEY")),
+        "default_translation_provider": default_translation_provider(),
         "max_upload_mb": MAX_UPLOAD_BYTES // 1024 // 1024,
     }
 
@@ -442,7 +486,7 @@ async def create_job(
     page_range: str = Form("all"),
     ocr_setting: str = Form("auto"),
     target: str = Form("zh"),
-    translation_provider: str = Form("gemini"),
+    translation_provider: str = Form(""),
     quality: str = Form("economy"),
     translation_output: str = Form("translation"),
     output_formats: str = Form("md,docx"),
@@ -458,6 +502,7 @@ async def create_job(
         raise HTTPException(400, "Invalid OCR setting.")
     if target not in {"zh", "en"} or quality not in {"economy", "quality"}:
         raise HTTPException(400, "Invalid translation target or quality setting.")
+    translation_provider = translation_provider or default_translation_provider()
     if translation_provider not in {"gemini", "deepseek"}:
         raise HTTPException(400, "Invalid translation provider.")
     if translation_provider == "deepseek" and not os.environ.get("DEEPSEEK_API_KEY"):

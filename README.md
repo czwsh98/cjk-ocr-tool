@@ -11,8 +11,9 @@ Yomu is a small private web app for two document workflows:
 - For PDFs, automatically use embedded text when available and OCR only scanned pages.
 - Choose OCR behavior per job: automatic, always OCR, or never OCR.
 - Process PDF pages sequentially to keep memory use bounded on a small VPS.
-- Use Gemini Flash-Lite for economy mode and Gemini Flash for quality mode.
-- Optionally use DeepSeek V4 Flash for Japanese translation when `DEEPSEEK_API_KEY` is configured; OCR remains on Gemini.
+- Use Gemini 3.1 Flash-Lite for economy mode; quality mode uses 3.5 Flash-Lite for OCR and 3.7 Flash for translation.
+- Prefer DeepSeek V4 Flash for translation whenever `DEEPSEEK_API_KEY` is set. It is the default in that case because it benchmarked both cheaper and more faithful than every Gemini tier. OCR always stays on Gemini.
+- Report an explicit "cost estimate unavailable" instead of `$0.0000` when a configured model has no published price.
 - Report input/output tokens and an estimated API cost.
 - Split long translation inputs at paragraph boundaries to avoid silent output truncation.
 - Reject blocked, truncated, or empty model responses instead of exporting blank pages.
@@ -44,7 +45,7 @@ See [`.env.example`](.env.example). The most important variables are:
 | Variable | Purpose |
 |---|---|
 | `GOOGLE_API_KEY` | Required for Gemini OCR and translation |
-| `DEEPSEEK_API_KEY` | Optional; enables DeepSeek translation |
+| `DEEPSEEK_API_KEY` | Optional; when set, DeepSeek becomes the default translation provider |
 | `MAX_UPLOAD_MB` | Upload limit, default 50 MB |
 | `MAX_WORKERS` | Concurrent jobs, default 2 |
 | `JOB_TTL_HOURS` | Temporary-output lifetime, default 6 hours |
