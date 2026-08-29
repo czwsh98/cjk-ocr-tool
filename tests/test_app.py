@@ -5,6 +5,7 @@ import pymupdf
 from fastapi.testclient import TestClient
 
 import app
+from ocr_client import ModelResult
 
 
 client = TestClient(app.app)
@@ -83,3 +84,23 @@ def test_rejects_fake_pdf():
         files={"file": ("fake.pdf", b"not a pdf", "application/pdf")},
     )
     assert response.status_code == 400
+
+
+def test_long_translation_is_chunked(monkeypatch):
+    calls = []
+
+    def fake_translate(text, target, *, provider, quality):
+        calls.append(text)
+        return ModelResult(text=f"译：{text}", provider="gemini", model="custom-model", input_tokens=1, output_tokens=1)
+
+    monkeypatch.setattr(app, "translate_text", fake_translate)
+    chunks = app._translation_chunks("甲" * 15 + "\n\n" + "乙" * 15, max_chars=20)
+    assert len(chunks) == 2
+    assert all(len(chunk) <= 20 for chunk in chunks)
+
+
+def test_unknown_model_cost_is_unavailable(monkeypatch):
+    monkeypatch.delenv("GEMINI_INPUT_PRICE_USD_PER_MILLION", raising=False)
+    monkeypatch.delenv("GEMINI_OUTPUT_PRICE_USD_PER_MILLION", raising=False)
+    result = ModelResult("text", "gemini", "custom-model", 10, 10)
+    assert app._estimate_cost(result) is None

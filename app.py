@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import atexit
+import re
 import shutil
 import tempfile
 import threading
@@ -17,7 +19,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 
 from exporters import PageResult, write_docx, write_markdown
 from ocr_client import ocr_image, postprocess_translation_ready_text, translate_text
-from pdf_processor import extract_pdf_page_text, pdf_page_count, pdf_page_to_png
+from pdf_processor import extract_pdf_page_text, pdf_page_count, pdf_page_to_image
 from range_utils import parse_page_range
 
 
@@ -27,10 +29,13 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "50")) * 1024 * 1024
 JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_HOURS", "6")) * 3600
 TEXT_THRESHOLD = int(os.environ.get("PDF_TEXT_THRESHOLD", "80"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))
+TRANSLATION_CHUNK_CHARS = max(1000, int(os.environ.get("TRANSLATION_CHUNK_CHARS", "12000")))
+WORK_PREFIX = "cjkocr_"
 
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
 _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="cjk-job")
+_cleanup_stop = threading.Event()
 
 
 def _job_update(job_id: str, **kwargs: object) -> None:
@@ -51,6 +56,40 @@ def _cleanup_expired_jobs() -> None:
         shutil.rmtree(job["work_root"], ignore_errors=True)
 
 
+def _cleanup_orphan_workdirs() -> None:
+    """Remove stale app-owned temp directories not represented by a live job."""
+    cutoff = time.time() - JOB_TTL_SECONDS
+    with _jobs_lock:
+        active_roots = {Path(job["work_root"]).resolve() for job in _jobs.values()}
+    temp_root = Path(tempfile.gettempdir())
+    for path in temp_root.glob(f"{WORK_PREFIX}*"):
+        try:
+            if not path.is_dir() or path.resolve() in active_roots or path.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def _cleanup_all_workdirs() -> None:
+    with _jobs_lock:
+        roots = [Path(job["work_root"]) for job in _jobs.values()]
+    for root in roots:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _cleanup_loop() -> None:
+    while not _cleanup_stop.wait(300):
+        _cleanup_expired_jobs()
+        _cleanup_orphan_workdirs()
+
+
+_cleanup_orphan_workdirs()
+threading.Thread(target=_cleanup_loop, name="cjk-cleanup", daemon=True).start()
+atexit.register(_cleanup_stop.set)
+atexit.register(_cleanup_all_workdirs)
+
+
 def _record_usage(job_id: str, result) -> None:
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -58,23 +97,77 @@ def _record_usage(job_id: str, result) -> None:
             return
         job["input_tokens"] += result.input_tokens
         job["output_tokens"] += result.output_tokens
-        job["estimated_cost_usd"] += _estimate_cost(result)
+        estimate = _estimate_cost(result)
+        if estimate is None:
+            job["estimated_cost_usd"] = None
+            job["cost_estimate_available"] = False
+        elif job.get("cost_estimate_available", True):
+            job["estimated_cost_usd"] += estimate
         if result.model and result.model not in job["models"]:
             job["models"].append(result.model)
 
 
-def _estimate_cost(result) -> float:
+def _estimate_cost(result) -> float | None:
     """Estimate standard token cost; DeepSeek follows the call's UTC rate window."""
     prices = {
         "gemini-2.5-flash-lite": (0.10, 0.40),
         "gemini-2.5-flash": (0.30, 2.50),
+        "gemini-3.1-flash-lite": (0.25, 1.50),
+        "gemini-3.5-flash-lite": (0.30, 2.50),
+        "gemini-3.7-flash": (0.75, 3.75),
     }
-    if result.model == "deepseek-v4-flash":
+    model_id = (result.model or "").rsplit("/", 1)[-1]
+    if model_id == "deepseek-v4-flash":
         now = datetime.now(timezone.utc)
         peak = now.weekday() < 5 and (1 <= now.hour < 4 or 6 <= now.hour < 10)
-        prices[result.model] = (0.44, 1.32) if peak else (0.22, 0.66)
-    input_price, output_price = prices.get(result.model, (0.0, 0.0))
+        prices[model_id] = (0.44, 1.32) if peak else (0.22, 0.66)
+    price = prices.get(model_id)
+    if price is None:
+        provider_prefix = "GEMINI" if result.provider == "gemini" else "DEEPSEEK"
+        input_override = os.environ.get(f"{provider_prefix}_INPUT_PRICE_USD_PER_MILLION")
+        output_override = os.environ.get(f"{provider_prefix}_OUTPUT_PRICE_USD_PER_MILLION")
+        if input_override is None or output_override is None:
+            return None
+        try:
+            price = (float(input_override), float(output_override))
+        except ValueError:
+            return None
+    input_price, output_price = price
     return (result.input_tokens * input_price + result.output_tokens * output_price) / 1_000_000
+
+
+def _translation_chunks(text: str, max_chars: int = TRANSLATION_CHUNK_CHARS) -> list[str]:
+    """Split long text at paragraph/line boundaries before sending it to a model."""
+    if len(text) <= max_chars:
+        return [text]
+    paragraphs = re.split(r"\n{2,}", text)
+    chunks: list[str] = []
+    current = ""
+
+    def add_piece(piece: str) -> None:
+        nonlocal current
+        if not piece:
+            return
+        if current and len(current) + 2 + len(piece) > max_chars:
+            chunks.append(current)
+            current = ""
+        current = f"{current}\n\n{piece}" if current else piece
+
+    for paragraph in paragraphs:
+        if len(paragraph) <= max_chars:
+            add_piece(paragraph)
+            continue
+        # A single huge paragraph (common in TXT exports) is split by lines,
+        # then by character count as a last resort.
+        for line in paragraph.splitlines() or [paragraph]:
+            if len(line) <= max_chars:
+                add_piece(line)
+                continue
+            for start in range(0, len(line), max_chars):
+                add_piece(line[start : start + max_chars])
+    if current:
+        chunks.append(current)
+    return chunks or [text]
 
 
 def _extract_page(
@@ -95,7 +188,7 @@ def _extract_page(
         return native_text
 
     page_dir = work_root / "page_image"
-    image_path = pdf_page_to_png(file_path, page_dir, page_number)
+    image_path = pdf_page_to_image(file_path, page_dir, page_number)
     try:
         result = ocr_image(image_path, quality=quality)
         _record_usage(job_id, result)
@@ -160,14 +253,17 @@ def _run_pipeline(job_id: str) -> None:
             _job_update(job_id, stage="translating", done_pages=0)
             for index, page in enumerate(pages, start=1):
                 _job_update(job_id, stage=f"translating_page_{page.page}", current_page=page.page)
-                result = translate_text(
-                    page.source,
-                    job["target"],
-                    provider=job["translation_provider"],
-                    quality=job["quality"],
-                )
-                _record_usage(job_id, result)
-                page.translation = postprocess_translation_ready_text(result.text)
+                translations: list[str] = []
+                for chunk in _translation_chunks(page.source):
+                    result = translate_text(
+                        chunk,
+                        job["target"],
+                        provider=job["translation_provider"],
+                        quality=job["quality"],
+                    )
+                    _record_usage(job_id, result)
+                    translations.append(postprocess_translation_ready_text(result.text).strip())
+                page.translation = "\n\n".join(item for item in translations if item)
                 _job_update(
                     job_id,
                     done_pages=index,
@@ -284,11 +380,11 @@ function setMode(next){mode=next;$$('.mode').forEach(x=>x.classList.toggle('acti
 $$('.mode').forEach(x=>x.onclick=()=>setMode(x.dataset.mode));
 
 function useFile(file){const ext=file.name.toLowerCase().split('.').pop();if(!['pdf','txt','md'].includes(ext)){showError('请选择 PDF、TXT 或 Markdown 文件。');return}selectedFile=file;$('#fileName').textContent=file.name;$('#fileInfo').textContent=`${(file.size/1024/1024).toFixed(2)} MB · ${ext.toUpperCase()}`;$('#filePill').classList.add('show');settings.classList.add('show');$$('.pdf-only').forEach(x=>x.classList.toggle('hidden',ext!=='pdf'));errorBox.classList.remove('show');}
-fileInput.onchange=()=>fileInput.files[0]&&useFile(fileInput.files[0]);drop.ondragover=e=>{e.preventDefault();drop.classList.add('drag')};drop.ondragleave=()=>drop.classList.remove('drag');drop.ondrop=e=>{e.preventDefault();drop.classList.remove('drag');e.dataTransfer.files[0]&&useFile(e.dataTransfer.files[0])};$('#remove').onclick=()=>{selectedFile=null;fileInput.value='';$('#filePill').classList.remove('show');settings.classList.remove('show');progress.classList.remove('show')};
+fileInput.onchange=()=>fileInput.files[0]&&useFile(fileInput.files[0]);drop.ondragover=e=>{e.preventDefault();drop.classList.add('drag')};drop.ondragleave=()=>drop.classList.remove('drag');drop.ondrop=e=>{e.preventDefault();drop.classList.remove('drag');e.dataTransfer.files[0]&&useFile(e.dataTransfer.files[0])};$('#remove').onclick=()=>{clearInterval(pollTimer);pollTimer=null;selectedFile=null;fileInput.value='';$('#filePill').classList.remove('show');settings.classList.remove('show');progress.classList.remove('show');$('#start').disabled=false};
 
 function checked(name){return document.querySelector(`input[name="${name}"]:checked`)?.value}
 function showError(message){errorBox.textContent=message;errorBox.classList.add('show')}
-function stageLabel(stage){if(stage==='preparing')return'正在检查文件';if(stage==='extracting')return'开始提取文字';if(stage.startsWith('extracting_page_'))return`正在提取第 ${stage.split('_').pop()} 页`;if(stage==='translating')return'开始翻译';if(stage.startsWith('translating_page_'))return`正在翻译第 ${stage.split('_').pop()} 页`;if(stage==='done')return'处理完成';return stage||'等待中'}
+function stageLabel(stage){if(stage==='queued')return'排队等待中';if(stage==='preparing')return'正在检查文件';if(stage==='extracting')return'开始提取文字';if(stage.startsWith('extracting_page_'))return`正在提取第 ${stage.split('_').pop()} 页`;if(stage==='translating')return'开始翻译';if(stage.startsWith('translating_page_'))return`正在翻译第 ${stage.split('_').pop()} 页`;if(stage==='done')return'处理完成';return stage||'等待中'}
 
 async function loadConfig(){try{const r=await fetch('/api/config');const c=await r.json();if(c.deepseek){const o=document.createElement('option');o.value='deepseek';o.textContent='DeepSeek V4 Flash';$('#provider').appendChild(o)}else{$('#providerHelp').textContent='未配置 DeepSeek key，目前使用 Gemini。'}}catch{}}
 loadConfig();
@@ -305,7 +401,7 @@ function poll(jobId){
       $('#counter').textContent=`${j.done_pages} / ${j.total_pages||'—'}`;
       $('#bar').style.width=(j.total_pages?Math.round(j.done_pages/j.total_pages*100):3)+'%';
       $('#pagesStat').textContent=j.document_pages?`文档 ${j.document_pages} 页 · 已选 ${j.selected_pages.length} 页`:'';
-      $('#tokenStat').textContent=(j.input_tokens||j.output_tokens)?`Tokens ${j.input_tokens} in / ${j.output_tokens} out · est. $${j.estimated_cost_usd.toFixed(4)}`:'';
+      $('#tokenStat').textContent=(j.input_tokens||j.output_tokens)?`Tokens ${j.input_tokens} in / ${j.output_tokens} out · ${j.cost_estimate_available&&j.estimated_cost_usd!=null?`est. $${j.estimated_cost_usd.toFixed(4)}`:'cost estimate unavailable'}`:'';
       $('#modelStat').textContent=(j.models||[]).join(' · ');
       $('#preview').textContent=j.preview_text||'处理中…';
       if(j.status==='error'){clearInterval(pollTimer);showError(j.error||'处理失败');$('#start').disabled=false}
@@ -418,6 +514,7 @@ async def create_job(
         "input_tokens": 0,
         "output_tokens": 0,
         "estimated_cost_usd": 0.0,
+        "cost_estimate_available": True,
         "models": [],
         "outputs": {},
     }
@@ -438,7 +535,7 @@ def get_job(job_id: str) -> dict:
             for key in (
                 "status", "stage", "error", "document_pages", "selected_pages",
                 "total_pages", "done_pages", "current_page", "preview_text",
-                "input_tokens", "output_tokens", "estimated_cost_usd", "models",
+                "input_tokens", "output_tokens", "estimated_cost_usd", "cost_estimate_available", "models",
             )
         }
         response["outputs"] = {fmt: True for fmt in job["outputs"]}
@@ -461,7 +558,8 @@ def download(job_id: str, fmt: str):
     if not path.is_file():
         raise HTTPException(404, "Output file has expired.")
     media_type = "text/markdown; charset=utf-8" if fmt == "md" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    return FileResponse(path, media_type=media_type, filename=f"{Path(filename).stem}.{fmt}")
+    stem = re.sub(r'[\x00-\x1f\x7f"\\]', "_", Path(filename).stem).strip() or "document"
+    return FileResponse(path, media_type=media_type, filename=f"{stem}.{fmt}")
 
 
 def main() -> None:

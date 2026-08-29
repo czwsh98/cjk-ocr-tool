@@ -9,8 +9,10 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 from google import genai
 from google.genai import errors as genai_errors
+from google.genai import types
 from PIL import Image
 
 
@@ -45,8 +47,17 @@ TRANSLATE_PROMPT_ZH = """你是一位專業的中日翻譯。請將以下文字�
 
 
 _SENTENCE_END = set("。！？.!?」』）】…")
-_CJK_EDGE_RE = re.compile(r"[\u3000-\u30ff\u3400-\u9fff\uf900-\ufaff]$")
-_CJK_START_RE = re.compile(r"^[\u3000-\u30ff\u3400-\u9fff\uf900-\ufaff]")
+_CJK_EDGE_RE = re.compile(r"[\u3000-\u30ff\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]$")
+_CJK_START_RE = re.compile(r"^[\u3000-\u30ff\u3400-\u9fff\uf900-\ufaff\uff00-\uffef]")
+_LIST_ITEM_RE = re.compile(
+    r"^\s*(?:[-*+・•]|\d+[.、)]|[（(]\d+[）)]|[一二三四五六七八九十百千万]+[、.])\s*"
+)
+_MARKDOWN_HEADING_RE = re.compile(r"^\s*#{1,6}\s+")
+_NAMED_HEADING_RE = re.compile(
+    r"^\s*(?:第\s*[0-9０-９一二三四五六七八九十百千万]+\s*[章節部篇]|"
+    r"序章|導論|緒論|前言|目次|摘要|参考文献|參考文獻|"
+    r"Introduction|Conclusion|References|Appendix)(?:\b|$)"
+)
 
 
 @dataclass(slots=True)
@@ -83,6 +94,12 @@ def postprocess_translation_ready_text(text: str) -> str:
         if not buf:
             buf = s
             continue
+        # Structural lines must stay separate. In particular, joining a heading
+        # or two list items creates invalid Markdown and changes DOCX layout.
+        if _is_list_item(buf) or _is_list_item(s) or _is_heading(buf) or _is_heading(s):
+            flush_buf()
+            buf = s
+            continue
         if buf.endswith("-") and not buf.endswith("--"):
             buf = buf[:-1] + s
             continue
@@ -109,6 +126,24 @@ def postprocess_translation_ready_text(text: str) -> str:
     return text_out.strip() + ("\n" if text_out.strip() else "")
 
 
+def _is_list_item(line: str) -> bool:
+    return bool(_LIST_ITEM_RE.match(line))
+
+
+def _is_heading(line: str) -> bool:
+    """Recognize common headings without treating ordinary CJK soft wraps as headings."""
+    if _MARKDOWN_HEADING_RE.match(line) or _NAMED_HEADING_RE.match(line):
+        return True
+    # Short standalone Latin headings are common in mixed-language documents.
+    if len(line) <= 60 and not line.endswith(tuple(_SENTENCE_END)) and not _CJK_EDGE_RE.search(line):
+        return bool(re.fullmatch(r"[A-Z][A-Za-z0-9 &'/:,-]{1,59}", line))
+    # Short all-kanji titles (e.g. 研究背景) have no punctuation or Latin
+    # heading marker, but are still structurally distinct from prose.
+    if len(line) <= 16 and re.fullmatch(r"[\u3400-\u4dbf\u4e00-\u9fff\uF900-\uFAFF]{2,16}", line):
+        return True
+    return False
+
+
 _RETRYABLE_CODES = {429, 503}
 _RETRY_DELAYS = [5, 15, 30]  # seconds between attempts
 
@@ -118,7 +153,7 @@ def _gemini_text(contents: list, *, model: str) -> ModelResult:
     api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("Set GOOGLE_API_KEY (or GEMINI_API_KEY) for Gemini vision OCR.")
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=120_000))
     last_exc: Exception | None = None
     for attempt, delay in enumerate([0] + _RETRY_DELAYS):
         if delay:
@@ -127,17 +162,34 @@ def _gemini_text(contents: list, *, model: str) -> ModelResult:
             resp = client.models.generate_content(model=model, contents=contents)
             if not resp.candidates:
                 raise RuntimeError("Gemini returned no candidates.")
+            candidate = resp.candidates[0]
+            finish_reason = getattr(candidate, "finish_reason", None)
+            reason_name = str(getattr(finish_reason, "name", finish_reason or "")).upper()
+            reason_name = reason_name.rsplit(".", 1)[-1]
+            try:
+                response_text = (resp.text or "").strip()
+            except (AttributeError, ValueError):
+                response_text = ""
+            if reason_name not in {"", "STOP", "FINISH_REASON_UNSPECIFIED", "UNSPECIFIED"}:
+                raise RuntimeError(
+                    f"Gemini did not finish normally ({reason_name}); no output was exported."
+                )
+            if not response_text:
+                raise RuntimeError("Gemini returned no usable text.")
             usage = getattr(resp, "usage_metadata", None)
             return ModelResult(
-                text=(resp.text or "").strip(),
+                text=response_text,
                 provider="gemini",
                 model=model,
                 input_tokens=int(getattr(usage, "prompt_token_count", 0) or 0),
                 output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0),
             )
-        except (genai_errors.ServerError, genai_errors.ClientError) as e:
+        except (genai_errors.ServerError, genai_errors.ClientError, httpx.NetworkError, httpx.TimeoutException) as e:
             code = getattr(e, "status_code", None) or getattr(e, "code", None)
             if code in _RETRYABLE_CODES and attempt < len(_RETRY_DELAYS):
+                last_exc = e
+                continue
+            if isinstance(e, (httpx.NetworkError, httpx.TimeoutException)) and attempt < len(_RETRY_DELAYS):
                 last_exc = e
                 continue
             raise
@@ -186,8 +238,21 @@ def _deepseek_text(prompt: str) -> ModelResult:
             with urllib.request.urlopen(request, timeout=120) as response:
                 data = json.loads(response.read().decode("utf-8"))
             usage = data.get("usage") or {}
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError("DeepSeek returned no choices.")
+            choice = choices[0]
+            finish_reason = str(choice.get("finish_reason") or "").lower()
+            if finish_reason not in {"", "stop"}:
+                raise RuntimeError(
+                    f"DeepSeek did not finish normally ({finish_reason}); no output was exported."
+                )
+            message = choice.get("message") or {}
+            response_text = (message.get("content") or "").strip()
+            if not response_text:
+                raise RuntimeError("DeepSeek returned no usable text.")
             return ModelResult(
-                text=(data["choices"][0]["message"].get("content") or "").strip(),
+                text=response_text,
                 provider="deepseek",
                 model=model,
                 input_tokens=int(usage.get("prompt_tokens") or 0),

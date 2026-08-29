@@ -14,6 +14,8 @@ Yomu is a small private web app for two document workflows:
 - Use Gemini Flash-Lite for economy mode and Gemini Flash for quality mode.
 - Optionally use DeepSeek V4 Flash for Japanese translation when `DEEPSEEK_API_KEY` is configured; OCR remains on Gemini.
 - Report input/output tokens and an estimated API cost.
+- Split long translation inputs at paragraph boundaries to avoid silent output truncation.
+- Reject blocked, truncated, or empty model responses instead of exporting blank pages.
 - Export structured `.md` and styled `.docx` files.
 - Limit upload size, worker concurrency, and temporary-file lifetime.
 
@@ -46,6 +48,11 @@ See [`.env.example`](.env.example). The most important variables are:
 | `MAX_UPLOAD_MB` | Upload limit, default 50 MB |
 | `MAX_WORKERS` | Concurrent jobs, default 2 |
 | `JOB_TTL_HOURS` | Temporary-output lifetime, default 6 hours |
+| `TRANSLATION_CHUNK_CHARS` | Maximum source characters per translation request, default 12,000 |
+
+When using a custom model ID, set the optional provider input/output price variables in
+[`.env.example`](.env.example) if you want a cost estimate. Otherwise the UI reports that
+the estimate is unavailable instead of displaying `$0.0000`.
 
 The app listens on `127.0.0.1` by default. Keep it private behind a reverse proxy or Cloudflare Tunnel rather than binding it directly to a public interface.
 

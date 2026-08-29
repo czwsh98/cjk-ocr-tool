@@ -19,14 +19,14 @@ def extract_pdf_page_text(pdf_path: Path, page_number: int) -> str:
         return doc.load_page(page_number - 1).get_text()
 
 
-def pdf_page_to_png(
+def pdf_page_to_image(
     pdf_path: Path,
     out_dir: Path,
     page_number: int,
     *,
     dpi: int = 240,
 ) -> Path:
-    """Rasterize one page at a time so large PDFs do not exhaust RAM."""
+    """Rasterize one page at a time and return the generated JPEG path."""
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = convert_from_path(
         pdf_path.as_posix(),
@@ -42,3 +42,7 @@ def pdf_page_to_png(
     if not paths:
         raise RuntimeError(f"Could not rasterize page {page_number}.")
     return Path(paths[0])
+
+
+# Backward-compatible name for callers from earlier versions.
+pdf_page_to_png = pdf_page_to_image
