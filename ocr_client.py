@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 from google import genai
@@ -10,13 +14,14 @@ from google.genai import errors as genai_errors
 from PIL import Image
 
 
-VISION_PROMPT_OCR = """You are a CJK document OCR assistant. Extract all body text from the image exactly as written, preserving the original language (Japanese, Traditional Chinese, Simplified Chinese, or mixed).
+VISION_PROMPT_OCR = """You are a Chinese and Japanese document OCR assistant. Extract the text from this page exactly as written, preserving Japanese, Traditional Chinese, Simplified Chinese, or mixed text.
 
 Rules:
 1. Output plain text only — no explanations, markdown, or labels.
-2. Do not output ruby/furigana/bopomofo annotations; keep only the base characters.
-3. Separate clearly distinct paragraphs with a single blank line. Treat other line breaks as soft wraps and output the text naturally so it can be rejoined downstream.
-4. Preserve the original script faithfully — do not convert between Traditional and Simplified Chinese, and do not transliterate or translate anything."""
+2. Preserve headings, lists, paragraph boundaries, and reading order. Use one blank line between paragraphs.
+3. Ignore page numbers and repeated running headers or footers when they are clearly decorative.
+4. Do not output ruby, furigana, or bopomofo annotations; keep only the base characters.
+5. Preserve the original script faithfully. Do not convert, transliterate, summarize, or translate."""
 
 TRANSLATE_PROMPT_EN = """You are a professional translator specialising in CJK languages. Translate the following text into natural, fluent English.
 
@@ -40,6 +45,17 @@ TRANSLATE_PROMPT_ZH = """你是一位專業的中日翻譯。請將以下文字�
 
 
 _SENTENCE_END = set("。！？.!?」』）】…")
+_CJK_EDGE_RE = re.compile(r"[\u3000-\u30ff\u3400-\u9fff\uf900-\ufaff]$")
+_CJK_START_RE = re.compile(r"^[\u3000-\u30ff\u3400-\u9fff\uf900-\ufaff]")
+
+
+@dataclass(slots=True)
+class ModelResult:
+    text: str
+    provider: str
+    model: str
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 def postprocess_translation_ready_text(text: str) -> str:
@@ -71,7 +87,8 @@ def postprocess_translation_ready_text(text: str) -> str:
             buf = buf[:-1] + s
             continue
         if buf[-1] not in _SENTENCE_END:
-            buf += s
+            separator = "" if _CJK_EDGE_RE.search(buf) or _CJK_START_RE.search(s) else " "
+            buf += separator + s
         else:
             merged.append(buf)
             buf = s
@@ -96,8 +113,8 @@ _RETRYABLE_CODES = {429, 503}
 _RETRY_DELAYS = [5, 15, 30]  # seconds between attempts
 
 
-def _gemini_text(contents: list, *, model: str) -> str:
-    """Call Gemini with retry on transient errors. Returns stripped response text."""
+def _gemini_text(contents: list, *, model: str) -> ModelResult:
+    """Call Gemini with retries and retain usage metadata for cost reporting."""
     api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("Set GOOGLE_API_KEY (or GEMINI_API_KEY) for Gemini vision OCR.")
@@ -110,7 +127,14 @@ def _gemini_text(contents: list, *, model: str) -> str:
             resp = client.models.generate_content(model=model, contents=contents)
             if not resp.candidates:
                 raise RuntimeError("Gemini returned no candidates.")
-            return (resp.text or "").strip()
+            usage = getattr(resp, "usage_metadata", None)
+            return ModelResult(
+                text=(resp.text or "").strip(),
+                provider="gemini",
+                model=model,
+                input_tokens=int(getattr(usage, "prompt_token_count", 0) or 0),
+                output_tokens=int(getattr(usage, "candidates_token_count", 0) or 0),
+            )
         except (genai_errors.ServerError, genai_errors.ClientError) as e:
             code = getattr(e, "status_code", None) or getattr(e, "code", None)
             if code in _RETRYABLE_CODES and attempt < len(_RETRY_DELAYS):
@@ -120,16 +144,99 @@ def _gemini_text(contents: list, *, model: str) -> str:
     raise last_exc  # type: ignore[misc]
 
 
+def _gemini_model(kind: str, quality: str) -> str:
+    if kind == "ocr":
+        key = "GEMINI_OCR_QUALITY_MODEL" if quality == "quality" else "GEMINI_OCR_MODEL"
+    else:
+        key = "GEMINI_TRANSLATION_QUALITY_MODEL" if quality == "quality" else "GEMINI_TRANSLATION_MODEL"
+    fallback = "gemini-2.5-flash" if quality == "quality" else "gemini-2.5-flash-lite"
+    return os.environ.get(key, fallback)
+
+
+def ocr_image(image_path: Path, *, quality: str = "economy") -> ModelResult:
+    model = _gemini_model("ocr", quality)
+    with Image.open(image_path.as_posix()) as img:
+        return _gemini_text([VISION_PROMPT_OCR, img], model=model)
+
+
+def _deepseek_text(prompt: str) -> ModelResult:
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("Set DEEPSEEK_API_KEY to use DeepSeek translation.")
+    model = os.environ.get("DEEPSEEK_TRANSLATION_MODEL", "deepseek-v4-flash")
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "thinking": {"type": "disabled"},
+            "max_tokens": 16384,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.deepseek.com/chat/completions",
+        data=payload,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate([0] + _RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            usage = data.get("usage") or {}
+            return ModelResult(
+                text=(data["choices"][0]["message"].get("content") or "").strip(),
+                provider="deepseek",
+                model=model,
+                input_tokens=int(usage.get("prompt_tokens") or 0),
+                output_tokens=int(usage.get("completion_tokens") or 0),
+            )
+        except urllib.error.HTTPError as exc:
+            if exc.code in _RETRYABLE_CODES and attempt < len(_RETRY_DELAYS):
+                last_exc = exc
+                continue
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"DeepSeek API returned HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            if attempt < len(_RETRY_DELAYS):
+                last_exc = exc
+                continue
+            raise RuntimeError(f"DeepSeek API connection failed: {exc.reason}") from exc
+    raise last_exc or RuntimeError("DeepSeek API request failed.")
+
+
+def translate_text(
+    text: str,
+    target: str,
+    *,
+    provider: str = "gemini",
+    quality: str = "economy",
+) -> ModelResult:
+    """Translate Japanese text to English or Traditional Chinese."""
+    if not text.strip():
+        return ModelResult("", provider, "")
+    if target not in {"en", "zh"}:
+        raise ValueError("Translation target must be 'en' or 'zh'.")
+    prompt = TRANSLATE_PROMPT_EN if target == "en" else TRANSLATE_PROMPT_ZH
+    if provider == "deepseek":
+        return _deepseek_text(prompt + text)
+    if provider != "gemini":
+        raise ValueError(f"Unsupported translation provider: {provider}.")
+    return _gemini_text([prompt + text], model=_gemini_model("translation", quality))
+
+
+# Backward-compatible wrappers for callers outside this app.
 def ocr_image_gemini(image_path: Path, *, model: str | None = None) -> str:
-    mname = model or os.environ.get("GEMINI_VISION_MODEL", "gemini-2.5-flash")
-    img = Image.open(image_path.as_posix())
-    return _gemini_text([VISION_PROMPT_OCR, img], model=mname)
+    if model:
+        with Image.open(image_path.as_posix()) as img:
+            return _gemini_text([VISION_PROMPT_OCR, img], model=model).text
+    return ocr_image(image_path).text
 
 
 def translate_text_gemini(text: str, target: str, *, model: str | None = None) -> str:
-    """Translate *text* to *target* ('en' or 'zh'). Returns translated string."""
-    if not text.strip():
-        return ""
-    mname = model or os.environ.get("GEMINI_VISION_MODEL", "gemini-2.5-flash")
-    prompt = TRANSLATE_PROMPT_EN if target == "en" else TRANSLATE_PROMPT_ZH
-    return _gemini_text([prompt + text], model=mname)
+    if model:
+        prompt = TRANSLATE_PROMPT_EN if target == "en" else TRANSLATE_PROMPT_ZH
+        return _gemini_text([prompt + text], model=model).text
+    return translate_text(text, target).text

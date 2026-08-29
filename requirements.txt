@@ -2,6 +2,7 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
+python-dotenv>=1.0.0
 
 # PDF → images (requires Poppler: brew install poppler)
 pdf2image>=1.17.0
@@ -9,9 +10,7 @@ Pillow>=10.0.0
 
 # PDF text extraction (no-OCR path)
 pymupdf>=1.24.0
+python-docx>=1.1.0
 
 # Vision OCR — default provider in ocr_client.py (Google Gen AI SDK)
 google-genai>=1.0.0
-
-# Optional: Claude Vision (uncomment if using Anthropic instead)
-# anthropic>=0.40.0

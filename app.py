@@ -1,896 +1,478 @@
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 import threading
+import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
-import fitz  # pymupdf — PDF text extraction (no-OCR path)
 from dotenv import load_dotenv
-
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
 
-from ocr_client import ocr_image_gemini, postprocess_translation_ready_text, translate_text_gemini
-from pdf_processor import pdf_to_png_pages
+from exporters import PageResult, write_docx, write_markdown
+from ocr_client import ocr_image, postprocess_translation_ready_text, translate_text
+from pdf_processor import extract_pdf_page_text, pdf_page_count, pdf_page_to_png
+from range_utils import parse_page_range
+
 
 load_dotenv()
 
-APP_DIR = Path(__file__).resolve().parent
-STATIC_DIR = APP_DIR / "static"
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "50")) * 1024 * 1024
+JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_HOURS", "6")) * 3600
+TEXT_THRESHOLD = int(os.environ.get("PDF_TEXT_THRESHOLD", "80"))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))
 
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
+_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="cjk-job")
 
 
 def _job_update(job_id: str, **kwargs: object) -> None:
     with _jobs_lock:
-        j = _jobs.get(job_id)
-        if j:
-            j.update(kwargs)
+        job = _jobs.get(job_id)
+        if job:
+            job.update(kwargs)
 
 
-def _extract_pdf_text(pdf_path: Path) -> list[str]:
-    """Extract text from each PDF page using PyMuPDF (no vision OCR)."""
-    doc = fitz.open(str(pdf_path))
-    pages = [page.get_text() for page in doc]
-    doc.close()
-    return pages
+def _cleanup_expired_jobs() -> None:
+    cutoff = time.time() - JOB_TTL_SECONDS
+    expired: list[dict] = []
+    with _jobs_lock:
+        for job_id, job in list(_jobs.items()):
+            if job["created_at"] < cutoff and job["status"] not in {"queued", "running"}:
+                expired.append(_jobs.pop(job_id))
+    for job in expired:
+        shutil.rmtree(job["work_root"], ignore_errors=True)
 
 
-def _run_pipeline(
+def _record_usage(job_id: str, result) -> None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        job["input_tokens"] += result.input_tokens
+        job["output_tokens"] += result.output_tokens
+        job["estimated_cost_usd"] += _estimate_cost(result)
+        if result.model and result.model not in job["models"]:
+            job["models"].append(result.model)
+
+
+def _estimate_cost(result) -> float:
+    """Estimate standard token cost; DeepSeek follows the call's UTC rate window."""
+    prices = {
+        "gemini-2.5-flash-lite": (0.10, 0.40),
+        "gemini-2.5-flash": (0.30, 2.50),
+    }
+    if result.model == "deepseek-v4-flash":
+        now = datetime.now(timezone.utc)
+        peak = now.weekday() < 5 and (1 <= now.hour < 4 or 6 <= now.hour < 10)
+        prices[result.model] = (0.44, 1.32) if peak else (0.22, 0.66)
+    input_price, output_price = prices.get(result.model, (0.0, 0.0))
+    return (result.input_tokens * input_price + result.output_tokens * output_price) / 1_000_000
+
+
+def _extract_page(
     job_id: str,
     file_path: Path,
     work_root: Path,
-    file_type: str,   # "pdf" | "txt"
-    ocr_enabled: bool,
-    translate: str,   # "none" | "en" | "zh"
-) -> None:
+    page_number: int,
+    ocr_setting: str,
+    quality: str,
+) -> str:
+    native_text = ""
+    if ocr_setting != "always":
+        native_text = extract_pdf_page_text(file_path, page_number)
+    should_ocr = ocr_setting == "always" or (
+        ocr_setting == "auto" and len(native_text.strip()) < TEXT_THRESHOLD
+    )
+    if not should_ocr:
+        return native_text
+
+    page_dir = work_root / "page_image"
+    image_path = pdf_page_to_png(file_path, page_dir, page_number)
     try:
-        _job_update(job_id, status="running", stage="starting", error=None)
-        page_texts: list[str] = []
+        result = ocr_image(image_path, quality=quality)
+        _record_usage(job_id, result)
+        return result.text
+    finally:
+        shutil.rmtree(page_dir, ignore_errors=True)
 
-        # ── Text extraction ────────────────────────────────────────────────
-        if file_type == "pdf" and ocr_enabled:
-            _job_update(job_id, stage="pdf_to_images")
-            pages_dir = work_root / "pages"
-            page_paths = pdf_to_png_pages(file_path, pages_dir, dpi=300)
-            total = len(page_paths)
-            _job_update(job_id, total_pages=total, done_pages=0, stage="ocr")
-            for i, p in enumerate(page_paths, start=1):
-                text = ocr_image_gemini(p)
-                page_texts.append(text or "")
-                preview = "\n".join(("\n\n".join(page_texts)).splitlines()[:30])
-                _job_update(job_id, done_pages=i, preview_text=preview, stage=f"ocr_page_{i}")
 
-        elif file_type == "pdf" and not ocr_enabled:
-            _job_update(job_id, stage="extracting_text")
-            page_texts = _extract_pdf_text(file_path)
-            _job_update(job_id, total_pages=len(page_texts), done_pages=len(page_texts))
+def _run_pipeline(job_id: str) -> None:
+    with _jobs_lock:
+        job = dict(_jobs[job_id])
+    file_path = Path(job["file_path"])
+    work_root = Path(job["work_root"])
 
-        else:  # txt
-            _job_update(job_id, stage="reading_file")
-            content = file_path.read_text(encoding="utf-8", errors="replace")
-            page_texts = [content]
-            _job_update(job_id, total_pages=1, done_pages=1)
-
-        raw = "\n\n".join(x for x in page_texts if x.strip())
-        extracted_text = postprocess_translation_ready_text(raw)
-        _job_update(job_id, preview_text="\n".join(extracted_text.splitlines()[:30]))
-
-        # ── Translation pass ───────────────────────────────────────────────
-        translation = ""
-        lang_label = ""
-        if translate in ("en", "zh"):
-            lang_label = "English" if translate == "en" else "Traditional Chinese"
-            total_chars = sum(len(t) for t in page_texts)
-            done_chars = 0
-            _job_update(job_id, stage=f"translating_to_{translate}",
-                        total_chars=total_chars, done_chars=0)
-            translated_pages: list[str] = []
-            for i, page_text in enumerate(page_texts, start=1):
-                _job_update(job_id, stage=f"translating_page_{i}")
-                translated_pages.append(translate_text_gemini(page_text, translate))
-                done_chars += len(page_text)
-                _job_update(job_id, done_chars=done_chars)
-            raw_translated = "\n\n".join(x for x in translated_pages if x.strip())
-            translation = postprocess_translation_ready_text(raw_translated)
-
-        # ── Build output ───────────────────────────────────────────────────
-        if translation:
-            final_txt = (
-                f"{'=' * 40}\n"
-                f"ORIGINAL\n"
-                f"{'=' * 40}\n\n"
-                f"{extracted_text}\n\n"
-                f"{'=' * 40}\n"
-                f"TRANSLATION ({lang_label})\n"
-                f"{'=' * 40}\n\n"
-                f"{translation}"
-            )
-            preview_text = "\n".join(translation.splitlines()[:40])
+    try:
+        _job_update(job_id, status="running", stage="preparing", error=None)
+        if job["file_type"] == "pdf":
+            total_document_pages = pdf_page_count(file_path)
+            selected_pages = parse_page_range(job["page_range"], total_document_pages)
         else:
-            final_txt = extracted_text
-            preview_text = "\n".join(extracted_text.splitlines()[:40])
-
-        out_path = work_root / "output.txt"
-        out_path.write_text(final_txt, encoding="utf-8")
+            total_document_pages = 1
+            selected_pages = [1]
+        if not selected_pages:
+            raise ValueError("No pages were selected.")
 
         _job_update(
             job_id,
-            status="done",
-            stage="done",
-            output_path=out_path.as_posix(),
-            preview_text=preview_text,
+            document_pages=total_document_pages,
+            selected_pages=selected_pages,
+            total_pages=len(selected_pages),
+            done_pages=0,
+            stage="extracting",
         )
-    except Exception as e:
-        tb = traceback.format_exc(limit=30)
-        _job_update(job_id, status="error", stage="error", error=f"{e}\n\n{tb}")
-    finally:
-        shutil.rmtree(work_root / "pages", ignore_errors=True)
+
+        pages: list[PageResult] = []
+        text_content = ""
+        if job["file_type"] != "pdf":
+            text_content = file_path.read_text(encoding="utf-8", errors="replace")
+
+        for index, page_number in enumerate(selected_pages, start=1):
+            _job_update(job_id, stage=f"extracting_page_{page_number}", current_page=page_number)
+            if job["file_type"] == "pdf":
+                source = _extract_page(
+                    job_id,
+                    file_path,
+                    work_root,
+                    page_number,
+                    job["ocr_setting"],
+                    job["quality"],
+                )
+            else:
+                source = text_content
+            source = postprocess_translation_ready_text(source)
+            pages.append(PageResult(page=page_number, source=source))
+            _job_update(
+                job_id,
+                done_pages=index,
+                preview_text="\n\n".join(p.source for p in pages)[-6000:],
+            )
+
+        if job["mode"] == "translate":
+            _job_update(job_id, stage="translating", done_pages=0)
+            for index, page in enumerate(pages, start=1):
+                _job_update(job_id, stage=f"translating_page_{page.page}", current_page=page.page)
+                result = translate_text(
+                    page.source,
+                    job["target"],
+                    provider=job["translation_provider"],
+                    quality=job["quality"],
+                )
+                _record_usage(job_id, result)
+                page.translation = postprocess_translation_ready_text(result.text)
+                _job_update(
+                    job_id,
+                    done_pages=index,
+                    preview_text="\n\n".join(p.translation for p in pages if p.translation)[-6000:],
+                )
+
+        target_label = "Traditional Chinese" if job["target"] == "zh" else "English"
+        include_translation = job["mode"] == "translate"
+        include_source = not include_translation or job["translation_output"] == "bilingual"
+        stem = Path(job["filename"]).stem or "document"
+        outputs: dict[str, str] = {}
+
+        if "md" in job["output_formats"]:
+            md_path = work_root / f"{stem}.md"
+            write_markdown(
+                md_path,
+                filename=job["filename"],
+                pages=pages,
+                include_source=include_source,
+                include_translation=include_translation,
+                target_label=target_label,
+            )
+            outputs["md"] = str(md_path)
+        if "docx" in job["output_formats"]:
+            docx_path = work_root / f"{stem}.docx"
+            write_docx(
+                docx_path,
+                filename=job["filename"],
+                pages=pages,
+                include_source=include_source,
+                include_translation=include_translation,
+                target_label=target_label,
+            )
+            outputs["docx"] = str(docx_path)
+
+        _job_update(job_id, status="done", stage="done", outputs=outputs, done_pages=len(pages))
+    except Exception as exc:
+        traceback.print_exc()
+        _job_update(job_id, status="error", stage="error", error=str(exc))
 
 
-# ── FastAPI app ────────────────────────────────────────────────────────────────
-
-app = FastAPI(title="CJK Document → Clean Text")
-if STATIC_DIR.is_dir():
-    app.mount("/static", StaticFiles(directory=STATIC_DIR.as_posix()), name="static")
+app = FastAPI(title="Yomu — CJK OCR & Translation")
 
 
-INDEX_HTML = """<!DOCTYPE html>
-<html lang="en">
+INDEX_HTML = r"""<!doctype html>
+<html lang="zh-Hant">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>読む — CJK OCR &amp; Translation</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+JP:wght@300;400&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&family=JetBrains+Mono:wght@300;400&display=swap" rel="stylesheet" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>読む — CJK OCR & Translation</title>
   <style>
-    :root {
-      --ink:          #1a1208;
-      --paper:        #f5f0e8;
-      --aged:         #e8e0ce;
-      --accent:       #8b2a0f;
-      --accent-light: #c94a1e;
-      --muted:        #7a6f5e;
-      --border:       #c8bea8;
-      --panel:        #faf7f2;
-    }
-
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-    body {
-      font-family: 'Libre Baskerville', Georgia, serif;
-      background: var(--paper);
-      background-image:
-        radial-gradient(ellipse at 15% 10%, rgba(139,42,15,0.05) 0%, transparent 50%),
-        radial-gradient(ellipse at 85% 90%, rgba(139,42,15,0.04) 0%, transparent 50%);
-      color: var(--ink);
-      min-height: 100vh;
-    }
-
-    /* ── Header ── */
-    header {
-      border-bottom: 1px solid var(--border);
-      padding: 18px 40px;
-      display: flex;
-      align-items: baseline;
-      gap: 14px;
-      background: var(--panel);
-    }
-    header h1 {
-      font-size: 1.6rem;
-      font-weight: 700;
-      letter-spacing: 0.02em;
-      color: var(--accent);
-    }
-    header .subtitle {
-      font-family: 'Noto Serif JP', serif;
-      font-size: 0.82rem;
-      color: var(--muted);
-      font-weight: 300;
-    }
-    header .tagline {
-      margin-left: auto;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.72rem;
-      color: var(--muted);
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-    }
-
-    /* ── Main layout ── */
-    main {
-      max-width: 720px;
-      margin: 0 auto;
-      padding: 36px 40px 60px;
-    }
-
-    /* ── Drop zone ── */
-    #fileInput { display: none; }
-    .drop-zone {
-      border: 1.5px dashed var(--border);
-      border-radius: 4px;
-      padding: 52px 32px;
-      text-align: center;
-      cursor: pointer;
-      background: var(--panel);
-      transition: border-color 0.2s, background 0.2s;
-      margin-bottom: 20px;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 8px;
-    }
-    .drop-zone:hover, .drop-zone.drag {
-      border-color: var(--accent);
-      background: rgba(139,42,15,0.025);
-    }
-    .dz-icon  { font-size: 2.6rem; line-height: 1; }
-    .dz-label { font-size: 1rem; font-weight: 700; color: var(--ink); margin-top: 4px; }
-    .dz-sub   { font-size: 0.82rem; color: var(--muted); font-style: italic; }
-
-    /* ── File pill ── */
-    .file-pill {
-      display: none;
-      align-items: center;
-      gap: 10px;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 2px;
-      padding: 10px 14px;
-      margin-bottom: 20px;
-    }
-    .file-pill.on { display: flex; }
-    .fp-icon { font-size: 1.1rem; flex-shrink: 0; }
-    .fp-name {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.8rem;
-      flex: 1;
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      color: var(--ink);
-    }
-    .fp-type {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.68rem;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--muted);
-      background: var(--aged);
-      border-radius: 2px;
-      padding: 2px 8px;
-      flex-shrink: 0;
-    }
-    .fp-clear {
-      background: none;
-      border: none;
-      color: var(--border);
-      cursor: pointer;
-      font-size: 0.9rem;
-      padding: 0 2px;
-      line-height: 1;
-      transition: color 0.15s;
-    }
-    .fp-clear:hover { color: var(--accent); }
-
-    /* ── Controls row ── */
-    .controls { display: none; gap: 10px; align-items: center; margin-bottom: 24px; flex-wrap: wrap; }
-    .controls.on { display: flex; }
-
-    /* OCR toggle chip */
-    .ocr-toggle {
-      display: flex;
-      border: 1px solid var(--border);
-      border-radius: 2px;
-      overflow: hidden;
-      flex-shrink: 0;
-    }
-    .ocr-toggle-btn {
-      padding: 8px 14px;
-      border: none;
-      background: transparent;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.72rem;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--muted);
-      cursor: pointer;
-      transition: background 0.15s, color 0.15s;
-      white-space: nowrap;
-    }
-    .ocr-toggle-btn.active {
-      background: var(--accent);
-      color: #fff;
-    }
-    .ocr-toggle-btn:not(.active):hover {
-      background: var(--aged);
-      color: var(--ink);
-    }
-    .ocr-toggle.hidden { display: none; }
-
-    /* Translation select */
-    .tr-select {
-      flex: 1;
-      min-width: 0;
-      padding: 8px 32px 8px 12px;
-      border: 1px solid var(--border);
-      border-radius: 2px;
-      font-family: 'Libre Baskerville', serif;
-      font-size: 0.82rem;
-      color: var(--ink);
-      background: var(--panel)
-        url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%237a6f5e' stroke-width='1.5' stroke-linecap='round' fill='none'/%3E%3C/svg%3E")
-        no-repeat right 12px center;
-      appearance: none;
-      transition: border-color 0.15s;
-    }
-    .tr-select:focus { outline: none; border-color: var(--accent); }
-
-    /* Process button */
-    .proc-btn {
-      padding: 9px 22px;
-      background: var(--accent);
-      color: #fff;
-      border: none;
-      border-radius: 2px;
-      font-family: 'Libre Baskerville', serif;
-      font-size: 0.82rem;
-      font-weight: 700;
-      letter-spacing: 0.02em;
-      cursor: pointer;
-      white-space: nowrap;
-      flex-shrink: 0;
-      transition: background 0.15s;
-    }
-    .proc-btn:hover:not(:disabled) { background: var(--accent-light); }
-    .proc-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-
-    /* ── Status bar ── */
-    .status-bar {
-      display: none;
-      align-items: center;
-      gap: 12px;
-      padding: 11px 18px;
-      background: var(--aged);
-      border-left: 3px solid var(--accent);
-      border-radius: 2px;
-      margin-bottom: 16px;
-      font-size: 0.84rem;
-      color: var(--muted);
-      font-style: italic;
-    }
-    .status-bar.on { display: flex; }
-    .spinner {
-      width: 15px; height: 15px;
-      border: 2px solid var(--border);
-      border-top-color: var(--accent);
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-      flex-shrink: 0;
-    }
-    .spinner.done { animation: none; border-color: var(--accent); border-top-color: transparent; }
-    .spinner.err  { animation: none; border-color: var(--accent-light); border-top-color: transparent; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .prog-lbl   { flex: 1; color: var(--ink); font-style: italic; }
-    .prog-count {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.72rem;
-      font-style: normal;
-      letter-spacing: 0.04em;
-      color: var(--muted);
-      white-space: nowrap;
-    }
-
-    /* ── Progress bar ── */
-    .bar-wrap { display: none; margin-bottom: 20px; }
-    .bar-wrap.on { display: block; }
-    .bar-track {
-      height: 3px;
-      background: var(--aged);
-      border-radius: 0;
-      overflow: hidden;
-    }
-    .bar-fill {
-      height: 100%;
-      background: var(--accent);
-      width: 0%;
-      transition: width 0.35s ease;
-    }
-    .bar-fill.done { background: var(--accent); width: 100%; }
-    .bar-fill.err  { background: var(--accent-light); width: 100%; }
-    .bar-fill.indeterminate { animation: slide 1.1s ease-in-out infinite; width: 28% !important; }
-    @keyframes slide { 0% { margin-left: -28%; } 100% { margin-left: 108%; } }
-
-    /* ── Error box ── */
-    .err-box {
-      display: none;
-      padding: 12px 18px;
-      background: #fef0ee;
-      border-left: 3px solid var(--accent-light);
-      border-radius: 2px;
-      font-size: 0.8rem;
-      color: var(--accent);
-      white-space: pre-wrap;
-      max-height: 160px;
-      overflow-y: auto;
-      margin-bottom: 16px;
-      font-style: italic;
-    }
-    .err-box.on { display: block; }
-
-    /* ── Preview panel ── */
-    .prev-panel { display: none; border: 1px solid var(--border); border-radius: 2px; overflow: hidden; margin-bottom: 20px; }
-    .prev-panel.on { display: block; }
-    .panel-header {
-      padding: 10px 18px;
-      background: var(--aged);
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .panel-title {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.68rem;
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      color: var(--muted);
-    }
-    .prev-toggle {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.68rem;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--muted);
-      background: none;
-      border: 1px solid var(--border);
-      border-radius: 2px;
-      padding: 3px 10px;
-      cursor: pointer;
-      transition: border-color 0.15s, color 0.15s;
-    }
-    .prev-toggle:hover { border-color: var(--ink); color: var(--ink); }
-    .prev-body {
-      display: none;
-      padding: 20px 22px;
-      background: var(--panel);
-      font-family: 'Noto Serif JP', serif;
-      font-size: 0.92rem;
-      font-weight: 300;
-      line-height: 2;
-      white-space: pre-wrap;
-      color: var(--ink);
-      max-height: 220px;
-      overflow-y: auto;
-    }
-    .prev-body.on { display: block; }
-
-    /* ── Download button ── */
-    .dl-btn {
-      display: none;
-      width: 100%;
-      padding: 11px;
-      background: var(--accent);
-      color: #fff;
-      text-align: center;
-      text-decoration: none;
-      border-radius: 2px;
-      font-family: 'Libre Baskerville', serif;
-      font-weight: 700;
-      font-size: 0.85rem;
-      letter-spacing: 0.02em;
-      transition: background 0.15s;
-    }
-    .dl-btn:hover { background: var(--accent-light); }
-    .dl-btn.on { display: block; }
-
-    /* ── Responsive ── */
-    @media (max-width: 600px) {
-      header { padding: 14px 20px; }
-      main { padding: 24px 20px 48px; }
-      .drop-zone { padding: 36px 20px; }
-      .controls { flex-direction: column; align-items: stretch; }
-      .ocr-toggle { justify-content: center; }
-    }
+    :root{--paper:#f6f0e7;--card:#fffdf8;--ink:#28231f;--muted:#756d64;--red:#9d2c21;--line:#d9cfc1;--soft:#eee4d8;--green:#45634d;--shadow:0 18px 55px rgba(69,48,29,.09)}
+    *{box-sizing:border-box} body{margin:0;background:var(--paper);color:var(--ink);font-family:Inter,"Noto Sans CJK TC","PingFang TC",system-ui,sans-serif;min-height:100vh}
+    header{height:72px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 40px;background:rgba(255,253,248,.65);backdrop-filter:blur(10px)}
+    .brand{display:flex;align-items:baseline;gap:13px}.brand strong{font:700 25px Georgia,"Noto Serif CJK JP",serif;color:var(--red)}.brand span{font:italic 14px Georgia,serif;color:var(--muted)}
+    .kicker{font:600 11px ui-monospace,monospace;letter-spacing:.18em;color:var(--muted)}
+    main{max-width:940px;margin:54px auto;padding:0 24px 70px}.intro{display:flex;justify-content:space-between;align-items:end;margin-bottom:26px;gap:24px}
+    h1{font:500 clamp(32px,5vw,52px)/1.08 Georgia,"Noto Serif CJK TC",serif;margin:0;max-width:640px}.intro p{margin:0 0 5px;color:var(--muted);max-width:260px;font-size:14px;line-height:1.6}
+    .panel{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:hidden}.section{padding:25px 28px;border-bottom:1px solid var(--soft)}.section:last-child{border-bottom:0}
+    .label{display:block;font-size:12px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:11px}
+    .modes{display:grid;grid-template-columns:1fr 1fr;gap:12px}.mode{border:1px solid var(--line);border-radius:12px;background:#fff;padding:18px;text-align:left;cursor:pointer;color:var(--ink)}.mode.active{border-color:var(--red);box-shadow:inset 0 0 0 1px var(--red);background:#fffaf5}.mode b{display:block;font:600 20px Georgia,"Noto Serif CJK TC",serif;margin-bottom:5px}.mode small{color:var(--muted);font-size:13px}
+    .drop{border:1.5px dashed #b9aa99;border-radius:12px;min-height:142px;display:flex;align-items:center;justify-content:center;text-align:center;cursor:pointer;transition:.2s;background:#fffcf7}.drop:hover,.drop.drag{border-color:var(--red);background:#fff7ef}.drop-icon{font:500 34px Georgia,serif}.drop b{display:block;font:600 16px Georgia,serif;margin:4px 0}.drop span{font-size:13px;color:var(--muted)}input[type=file]{display:none}
+    .file-pill{display:none;align-items:center;justify-content:space-between;border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-top:12px;background:#fff}.file-pill.show{display:flex}.file-meta{font-size:13px}.file-meta b{display:block;font-size:14px}.link-btn{border:0;background:none;color:var(--red);cursor:pointer;font-weight:700}
+    #settings{display:none}#settings.show{display:block}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.field label{display:block;font-size:13px;font-weight:650;margin-bottom:7px}.field small{display:block;color:var(--muted);margin-top:6px;line-height:1.35}
+    select,input[type=text]{width:100%;height:44px;border:1px solid var(--line);border-radius:9px;background:#fff;padding:0 12px;font:inherit;color:var(--ink);outline:none}select:focus,input[type=text]:focus{border-color:var(--red);box-shadow:0 0 0 3px rgba(157,44,33,.08)}
+    .choices{display:flex;flex-wrap:wrap;gap:9px}.choice{position:relative}.choice input{position:absolute;opacity:0}.choice span{display:block;border:1px solid var(--line);border-radius:999px;padding:9px 14px;background:#fff;font-size:13px;cursor:pointer}.choice input:checked+span{border-color:var(--red);color:var(--red);background:#fff7ef;font-weight:700}
+    .translation-only{display:none}.translation-only.show{display:block}.pdf-only.hidden{display:none}.action-row{display:flex;align-items:center;justify-content:space-between;gap:20px}.primary{border:0;border-radius:10px;background:var(--red);color:white;padding:13px 24px;font-weight:750;font-size:14px;cursor:pointer;min-width:165px}.primary:disabled{opacity:.45;cursor:not-allowed}.privacy{color:var(--muted);font-size:12px;line-height:1.5}
+    .progress{display:none}.progress.show{display:block}.progress-head{display:flex;justify-content:space-between;gap:20px;margin-bottom:10px}.progress-head b{font-family:Georgia,serif}.progress-head span{font:12px ui-monospace,monospace;color:var(--muted)}.bar{height:8px;background:var(--soft);border-radius:10px;overflow:hidden}.bar i{display:block;height:100%;width:0;background:var(--red);transition:width .35s}.stats{display:flex;gap:22px;flex-wrap:wrap;margin-top:13px;font-size:12px;color:var(--muted)}
+    .preview{white-space:pre-wrap;max-height:260px;overflow:auto;border:1px solid var(--soft);background:#fbf8f3;padding:15px;border-radius:9px;margin-top:16px;font:13px/1.65 Georgia,"Noto Serif CJK JP",serif}.downloads{display:flex;gap:10px;margin-top:16px}.downloads a{display:none;text-decoration:none;border:1px solid var(--red);color:var(--red);padding:9px 14px;border-radius:8px;font-size:13px;font-weight:700}.downloads a.show{display:inline-block}.error{display:none;margin-top:12px;color:#8c2119;background:#fff0ed;border:1px solid #ebc1ba;padding:12px;border-radius:8px;font-size:13px}.error.show{display:block}
+    @media(max-width:700px){header{padding:0 20px}.kicker{display:none}main{margin-top:32px}.intro{display:block}.intro p{margin-top:12px}.modes,.grid{grid-template-columns:1fr}.section{padding:21px 19px}.action-row{align-items:stretch;flex-direction:column}.primary{width:100%}}
   </style>
 </head>
 <body>
-
-<header>
-  <h1>読む</h1>
-  <span class="subtitle">yomu — read</span>
-  <span class="tagline">CJK OCR &amp; Translation</span>
-</header>
-
+<header><div class="brand"><strong>読む</strong><span>yomu — read</span></div><div class="kicker">CHINESE · JAPANESE · OCR · TRANSLATION</div></header>
 <main>
-  <!-- Drop zone -->
-  <label class="drop-zone" id="dropZone" for="fileInput">
-    <span class="dz-icon">文</span>
-    <span class="dz-label">Drop a PDF or TXT here</span>
-    <span class="dz-sub">Japanese, Chinese — scanned or machine-readable</span>
-  </label>
-  <input type="file" id="fileInput" accept=".pdf,.txt,text/plain,application/pdf" />
-
-  <!-- File pill -->
-  <div class="file-pill" id="filePill">
-    <span class="fp-icon" id="fpIcon">📄</span>
-    <span class="fp-name" id="fpName">—</span>
-    <span class="fp-type" id="fpType">PDF</span>
-    <button class="fp-clear" id="clearBtn" title="Remove file">✕</button>
-  </div>
-
-  <!-- Controls row -->
-  <div class="controls" id="controls">
-    <!-- OCR toggle (PDF only) -->
-    <div class="ocr-toggle" id="ocrToggle">
-      <button class="ocr-toggle-btn active" id="ocrOn"  onclick="setOcr(true)">OCR on</button>
-      <button class="ocr-toggle-btn"        id="ocrOff" onclick="setOcr(false)">OCR off</button>
+  <div class="intro"><h1>Turn documents into<br>clean, usable text.</h1><p>中文与日文的文字提取和翻译。选择范围，导出 Markdown 或 Word。</p></div>
+  <div class="panel">
+    <section class="section">
+      <span class="label">1 · 选择任务</span>
+      <div class="modes">
+        <button class="mode active" data-mode="extract"><b>提取文字</b><small>OCR 或直接提取 → Markdown / Word</small></button>
+        <button class="mode" data-mode="translate"><b>日文翻译</b><small>日文 → 繁体中文或英文</small></button>
+      </div>
+    </section>
+    <section class="section">
+      <span class="label">2 · 上传文件</span>
+      <label class="drop" id="drop"><input id="file" type="file" accept=".pdf,.txt,.md,application/pdf,text/plain"><div><div class="drop-icon">文</div><b>拖入 PDF、TXT 或 Markdown</b><span>最大 50 MB · 文件处理后自动过期</span></div></label>
+      <div class="file-pill" id="filePill"><div class="file-meta"><b id="fileName"></b><span id="fileInfo"></span></div><button class="link-btn" id="remove">移除</button></div>
+    </section>
+    <div id="settings">
+      <section class="section">
+        <span class="label">3 · 处理范围</span>
+        <div class="grid">
+          <div class="field pdf-only" id="rangeField"><label for="pageRange">页码范围</label><input id="pageRange" type="text" value="all" placeholder="all 或 1-5, 8, 12-18"><small>只处理指定页面，减少时间与 API 费用。</small></div>
+          <div class="field pdf-only" id="ocrField"><label for="ocrSetting">PDF 文字识别</label><select id="ocrSetting"><option value="auto">自动：优先读取已有文字</option><option value="always">始终使用 OCR</option><option value="never">永不 OCR</option></select><small>自动模式只对没有足够文本的扫描页调用 Vision API。</small></div>
+          <div class="field"><label>质量</label><div class="choices"><label class="choice"><input type="radio" name="quality" value="economy" checked><span>经济</span></label><label class="choice"><input type="radio" name="quality" value="quality"><span>高质量</span></label></div><small>经济使用 Gemini Flash-Lite；高质量使用 Gemini Flash。</small></div>
+          <div class="field translation-only" id="targetField"><label>翻译为</label><div class="choices"><label class="choice"><input type="radio" name="target" value="zh" checked><span>繁体中文</span></label><label class="choice"><input type="radio" name="target" value="en"><span>English</span></label></div></div>
+          <div class="field translation-only" id="providerField"><label for="provider">翻译服务</label><select id="provider"><option value="gemini">Gemini</option></select><small id="providerHelp">按服务器已配置的 API 显示。</small></div>
+          <div class="field translation-only" id="translationOutputField"><label>翻译输出</label><div class="choices"><label class="choice"><input type="radio" name="translationOutput" value="translation" checked><span>仅译文</span></label><label class="choice"><input type="radio" name="translationOutput" value="bilingual"><span>原文＋译文</span></label></div></div>
+          <div class="field"><label>导出格式</label><div class="choices"><label class="choice"><input type="checkbox" name="format" value="md" checked><span>Markdown</span></label><label class="choice"><input type="checkbox" name="format" value="docx" checked><span>Word</span></label></div></div>
+        </div>
+      </section>
+      <section class="section"><div class="action-row"><div class="privacy">应用仅监听服务器本机地址，并通过 Cloudflare Access 保护。<br>生成文件将在任务过期后清理。</div><button class="primary" id="start">开始提取</button></div><div class="error" id="error"></div></section>
     </div>
-
-    <!-- Translation select -->
-    <select class="tr-select" id="trSelect">
-      <option value="none">No Translation</option>
-      <option value="en">→ English</option>
-      <option value="zh">→ Chinese</option>
-    </select>
-
-    <!-- Process button -->
-    <button class="proc-btn" id="procBtn">Process →</button>
+    <section class="section progress" id="progress"><div class="progress-head"><b id="status">准备中</b><span id="counter">0 / 0</span></div><div class="bar"><i id="bar"></i></div><div class="stats"><span id="pagesStat"></span><span id="tokenStat"></span><span id="modelStat"></span></div><div class="preview" id="preview"></div><div class="downloads"><a id="mdDownload">下载 Markdown</a><a id="docxDownload">下载 Word</a></div></section>
   </div>
-
-  <!-- Status bar -->
-  <div class="status-bar" id="statusBar">
-    <div class="spinner" id="spinner"></div>
-    <span class="prog-lbl"  id="progLbl">Starting…</span>
-    <span class="prog-count" id="progCount"></span>
-  </div>
-
-  <!-- Progress bar -->
-  <div class="bar-wrap" id="barWrap">
-    <div class="bar-track"><div class="bar-fill indeterminate" id="barFill"></div></div>
-  </div>
-
-  <!-- Error -->
-  <div class="err-box" id="errBox"></div>
-
-  <!-- Preview panel -->
-  <div class="prev-panel" id="prevPanel">
-    <div class="panel-header">
-      <span class="panel-title">Preview</span>
-      <button class="prev-toggle" id="prevBtn">Show</button>
-    </div>
-    <div class="prev-body" id="prevBox"></div>
-  </div>
-
-  <!-- Download -->
-  <a class="dl-btn" id="dlBtn" href="#">↓ Download output.txt</a>
 </main>
-
 <script>
-  // ── Elements ────────────────────────────────────────────────────────────
-  const dropZone   = document.getElementById('dropZone');
-  const fileInput  = document.getElementById('fileInput');
-  const filePill   = document.getElementById('filePill');
-  const fpIcon     = document.getElementById('fpIcon');
-  const fpName     = document.getElementById('fpName');
-  const fpType     = document.getElementById('fpType');
-  const clearBtn   = document.getElementById('clearBtn');
-  const controls   = document.getElementById('controls');
-  const ocrToggle  = document.getElementById('ocrToggle');
-  const ocrOnBtn   = document.getElementById('ocrOn');
-  const ocrOffBtn  = document.getElementById('ocrOff');
-  const trSelect   = document.getElementById('trSelect');
-  const procBtn    = document.getElementById('procBtn');
-  const statusBar  = document.getElementById('statusBar');
-  const spinner    = document.getElementById('spinner');
-  const progLbl    = document.getElementById('progLbl');
-  const progCount  = document.getElementById('progCount');
-  const barWrap    = document.getElementById('barWrap');
-  const barFill    = document.getElementById('barFill');
-  const errBox     = document.getElementById('errBox');
-  const prevPanel  = document.getElementById('prevPanel');
-  const prevBtn    = document.getElementById('prevBtn');
-  const prevBox    = document.getElementById('prevBox');
-  const dlBtn      = document.getElementById('dlBtn');
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+let mode='extract', selectedFile=null, pollTimer=null;
+const drop=$('#drop'), fileInput=$('#file'), settings=$('#settings'), progress=$('#progress'), errorBox=$('#error');
 
-  // ── State ───────────────────────────────────────────────────────────────
-  let currentFile     = null;
-  let currentFileType = null;
-  let ocrEnabled      = true;
-  let pollTimer       = null;
+function setMode(next){mode=next;$$('.mode').forEach(x=>x.classList.toggle('active',x.dataset.mode===mode));$$('.translation-only').forEach(x=>x.classList.toggle('show',mode==='translate'));$('#start').textContent=mode==='translate'?'开始翻译':'开始提取';}
+$$('.mode').forEach(x=>x.onclick=()=>setMode(x.dataset.mode));
 
-  // ── OCR toggle ──────────────────────────────────────────────────────────
-  function setOcr(on) {
-    ocrEnabled = on;
-    ocrOnBtn.classList.toggle('active',  on);
-    ocrOffBtn.classList.toggle('active', !on);
-  }
-  // expose for onclick attributes
-  window.setOcr = setOcr;
+function useFile(file){const ext=file.name.toLowerCase().split('.').pop();if(!['pdf','txt','md'].includes(ext)){showError('请选择 PDF、TXT 或 Markdown 文件。');return}selectedFile=file;$('#fileName').textContent=file.name;$('#fileInfo').textContent=`${(file.size/1024/1024).toFixed(2)} MB · ${ext.toUpperCase()}`;$('#filePill').classList.add('show');settings.classList.add('show');$$('.pdf-only').forEach(x=>x.classList.toggle('hidden',ext!=='pdf'));errorBox.classList.remove('show');}
+fileInput.onchange=()=>fileInput.files[0]&&useFile(fileInput.files[0]);drop.ondragover=e=>{e.preventDefault();drop.classList.add('drag')};drop.ondragleave=()=>drop.classList.remove('drag');drop.ondrop=e=>{e.preventDefault();drop.classList.remove('drag');e.dataTransfer.files[0]&&useFile(e.dataTransfer.files[0])};$('#remove').onclick=()=>{selectedFile=null;fileInput.value='';$('#filePill').classList.remove('show');settings.classList.remove('show');progress.classList.remove('show')};
 
-  // ── Drop zone ───────────────────────────────────────────────────────────
-  dropZone.addEventListener('dragover',  (e) => { e.preventDefault(); dropZone.classList.add('drag'); });
-  dropZone.addEventListener('dragleave', ()  => dropZone.classList.remove('drag'));
-  dropZone.addEventListener('drop', (e) => {
-    e.preventDefault(); dropZone.classList.remove('drag');
-    if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
-  });
-  fileInput.addEventListener('change', () => {
-    if (fileInput.files.length) handleFile(fileInput.files[0]);
-  });
+function checked(name){return document.querySelector(`input[name="${name}"]:checked`)?.value}
+function showError(message){errorBox.textContent=message;errorBox.classList.add('show')}
+function stageLabel(stage){if(stage==='preparing')return'正在检查文件';if(stage==='extracting')return'开始提取文字';if(stage.startsWith('extracting_page_'))return`正在提取第 ${stage.split('_').pop()} 页`;if(stage==='translating')return'开始翻译';if(stage.startsWith('translating_page_'))return`正在翻译第 ${stage.split('_').pop()} 页`;if(stage==='done')return'处理完成';return stage||'等待中'}
 
-  function handleFile(file) {
-    const lower = file.name.toLowerCase();
-    if (!lower.endsWith('.pdf') && !lower.endsWith('.txt')) {
-      alert('Please choose a PDF or TXT file.');
-      return;
-    }
-    currentFile     = file;
-    currentFileType = lower.endsWith('.pdf') ? 'pdf' : 'txt';
+async function loadConfig(){try{const r=await fetch('/api/config');const c=await r.json();if(c.deepseek){const o=document.createElement('option');o.value='deepseek';o.textContent='DeepSeek V4 Flash';$('#provider').appendChild(o)}else{$('#providerHelp').textContent='未配置 DeepSeek key，目前使用 Gemini。'}}catch{}}
+loadConfig();
 
-    fpIcon.textContent = currentFileType === 'pdf' ? '📄' : '📝';
-    fpName.textContent = file.name;
-    fpType.textContent = currentFileType.toUpperCase();
+$('#start').onclick=async()=>{if(!selectedFile)return;const formats=$$('input[name="format"]:checked').map(x=>x.value);if(!formats.length){showError('至少选择一种导出格式。');return}errorBox.classList.remove('show');$('#start').disabled=true;progress.classList.add('show');$('#preview').textContent='';$$('.downloads a').forEach(x=>x.classList.remove('show'));const fd=new FormData();fd.append('file',selectedFile);fd.append('mode',mode);fd.append('page_range',$('#pageRange').value||'all');fd.append('ocr_setting',$('#ocrSetting').value);fd.append('target',checked('target')||'zh');fd.append('translation_provider',$('#provider').value);fd.append('quality',checked('quality'));fd.append('translation_output',checked('translationOutput')||'translation');fd.append('output_formats',formats.join(','));try{const r=await fetch('/api/jobs',{method:'POST',body:fd});const data=await r.json();if(!r.ok)throw new Error(data.detail||'无法创建任务');poll(data.job_id)}catch(e){showError(e.message);$('#start').disabled=false}};
 
-    dropZone.style.display = 'none';
-    filePill.classList.add('on');
-    ocrToggle.classList.toggle('hidden', currentFileType === 'txt');
-    controls.classList.add('on');
-    resetProgress();
-  }
-
-  clearBtn.addEventListener('click', () => {
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    currentFile = null; currentFileType = null; fileInput.value = '';
-    dropZone.style.display = '';
-    filePill.classList.remove('on');
-    controls.classList.remove('on');
-    resetProgress();
-    procBtn.disabled = false;
-  });
-
-  // ── Process ─────────────────────────────────────────────────────────────
-  procBtn.addEventListener('click', async () => {
-    if (!currentFile) return;
-    procBtn.disabled = true;
-    resetProgress();
-    statusBar.classList.add('on');
-    barWrap.classList.add('on');
-    progLbl.textContent = 'Uploading…';
-    barFill.className = 'bar-fill indeterminate';
-
-    try {
-      const fd = new FormData();
-      fd.append('file', currentFile);
-      fd.append('ocr_enabled', (currentFileType === 'pdf' && ocrEnabled) ? 'true' : 'false');
-      fd.append('translate', trSelect.value);
-      const res = await fetch('/api/jobs', { method: 'POST', body: fd });
-      if (!res.ok) { showError(await res.text()); return; }
-      const { job_id } = await res.json();
-      progLbl.textContent = 'Starting…';
-      startPoll(job_id);
-    } catch (err) {
-      showError('Upload failed: ' + (err.message || err));
-    }
-  });
-
-  // ── Helpers ─────────────────────────────────────────────────────────────
-  function resetProgress() {
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    statusBar.classList.remove('on');
-    barWrap.classList.remove('on');
-    spinner.className = 'spinner';
-    barFill.className = 'bar-fill indeterminate';
-    barFill.style.width = '';
-    progLbl.textContent = '';
-    progCount.textContent = '';
-    errBox.classList.remove('on');  errBox.textContent = '';
-    prevPanel.classList.remove('on');
-    prevBox.classList.remove('on'); prevBox.textContent = '';
-    prevBtn.textContent = 'Show';
-    dlBtn.classList.remove('on');
-  }
-
-  function setBar(pct, cls) {
-    barFill.className = 'bar-fill' + (cls ? ' ' + cls : '');
-    barFill.style.width = pct + '%';
-  }
-
-  function showError(msg) {
-    spinner.className = 'spinner err';
-    progLbl.textContent = 'Error';
-    setBar(100, 'err');
-    errBox.textContent = msg;
-    errBox.classList.add('on');
-    procBtn.disabled = false;
-  }
-
-  function stageLabel(stage) {
-    if (!stage || stage === 'starting' || stage === 'queued') return 'Starting…';
-    if (stage === 'pdf_to_images')   return 'Rendering pages…';
-    if (stage === 'extracting_text') return 'Extracting text…';
-    if (stage === 'reading_file')    return 'Reading file…';
-    if (stage === 'ocr')             return 'Starting OCR…';
-    if (stage.startsWith('ocr_page_'))          return `OCR — page ${stage.split('_').pop()}`;
-    if (stage.startsWith('translating_to_'))    return 'Translating…';
-    if (stage.startsWith('translating_page_'))  return `Translating — page ${stage.split('_').pop()}`;
-    return 'Processing…';
-  }
-
-  // ── Polling ─────────────────────────────────────────────────────────────
-  function startPoll(jobId) {
-    const withTranslation = trSelect.value !== 'none';
-    // OCR phase only runs for PDF files with OCR enabled; determines bar split
-    const hasOcrPhase = currentFileType === 'pdf' && ocrEnabled;
-    pollTimer = setInterval(async () => {
-      try {
-        const r = await fetch('/api/jobs/' + jobId);
-        if (!r.ok) { clearInterval(pollTimer); showError(await r.text()); return; }
-        const j = await r.json();
-        const inTranslation = j.stage && j.stage.startsWith('translating');
-
-        // Progress bar
-        if (j.status !== 'done') {
-          let pct = 0;
-          if (inTranslation && j.total_chars > 0) {
-            const charPct = j.done_chars / j.total_chars;
-            pct = hasOcrPhase
-              ? 60 + Math.round(charPct * 40)
-              : Math.round(charPct * 100);
-            const doneK = (j.done_chars / 1000).toFixed(1);
-            const totalK = (j.total_chars / 1000).toFixed(1);
-            progCount.textContent = `${doneK}k / ${totalK}k chars`;
-          } else if (!inTranslation && j.total_pages > 0) {
-            const base = Math.round((j.done_pages / j.total_pages) * 100);
-            pct = withTranslation ? Math.round(base * 0.6) : base;
-            progCount.textContent = `${j.done_pages} / ${j.total_pages} pages`;
-          }
-          if (pct > 0) setBar(pct);
-        }
-
-        if (j.status === 'running') progLbl.textContent = stageLabel(j.stage);
-
-        // Preview
-        if (j.preview_text) {
-          prevBox.textContent = j.preview_text;
-          prevPanel.classList.add('on');
-        }
-
-        if (j.status === 'done') {
-          clearInterval(pollTimer);
-          spinner.className = 'spinner done';
-          progLbl.textContent = 'Complete.';
-          setBar(100, 'done');
-          progCount.textContent = j.total_pages ? `${j.total_pages} pages` : '';
-          dlBtn.href = '/api/jobs/' + jobId + '/download';
-          dlBtn.classList.add('on');
-          procBtn.disabled = false;
-        }
-        if (j.status === 'error') {
-          clearInterval(pollTimer);
-          showError(j.error || 'Unknown error');
-        }
-      } catch (err) {
-        clearInterval(pollTimer);
-        showError('Connection lost: ' + (err.message || err));
+function poll(jobId){
+  clearInterval(pollTimer);
+  pollTimer=setInterval(async()=>{
+    try{
+      const r=await fetch('/api/jobs/'+jobId), j=await r.json();
+      if(!r.ok)throw new Error(j.detail||'任务读取失败');
+      $('#status').textContent=stageLabel(j.stage);
+      $('#counter').textContent=`${j.done_pages} / ${j.total_pages||'—'}`;
+      $('#bar').style.width=(j.total_pages?Math.round(j.done_pages/j.total_pages*100):3)+'%';
+      $('#pagesStat').textContent=j.document_pages?`文档 ${j.document_pages} 页 · 已选 ${j.selected_pages.length} 页`:'';
+      $('#tokenStat').textContent=(j.input_tokens||j.output_tokens)?`Tokens ${j.input_tokens} in / ${j.output_tokens} out · est. $${j.estimated_cost_usd.toFixed(4)}`:'';
+      $('#modelStat').textContent=(j.models||[]).join(' · ');
+      $('#preview').textContent=j.preview_text||'处理中…';
+      if(j.status==='error'){clearInterval(pollTimer);showError(j.error||'处理失败');$('#start').disabled=false}
+      if(j.status==='done'){
+        clearInterval(pollTimer);$('#bar').style.width='100%';$('#start').disabled=false;
+        for(const fmt of Object.keys(j.outputs)){const a=$('#'+fmt+'Download');a.href=`/api/jobs/${jobId}/download/${fmt}`;a.classList.add('show')}
       }
-    }, 800);
-  }
-
-  // ── Preview toggle ───────────────────────────────────────────────────────
-  prevBtn.addEventListener('click', () => {
-    const open = prevBox.classList.toggle('on');
-    prevBtn.textContent = open ? 'Hide' : 'Show';
-  });
+    }catch(e){clearInterval(pollTimer);showError(e.message);$('#start').disabled=false}
+  },700)
+}
 </script>
-</body>
-</html>
-"""
+</body></html>"""
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
-    if (STATIC_DIR / "index.html").is_file():
-        return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+def index() -> HTMLResponse:
     return HTMLResponse(INDEX_HTML)
 
 
-@app.post("/api/jobs")
-def create_job(
-    file: UploadFile = File(...),
-    ocr_enabled: str = Form("true"),
-    translate: str = Form("none"),
-):
-    fname = (file.filename or "").lower()
-    if not (fname.endswith(".pdf") or fname.endswith(".txt")):
-        raise HTTPException(status_code=400, detail="Only .pdf or .txt uploads are supported.")
-    if translate not in ("none", "en", "zh"):
-        raise HTTPException(status_code=400, detail="Invalid translate value.")
+@app.get("/healthz")
+def healthz() -> dict:
+    return {"status": "ok"}
 
-    file_type = "pdf" if fname.endswith(".pdf") else "txt"
-    ocr_flag = ocr_enabled.lower() == "true" and file_type == "pdf"
+
+@app.get("/api/config")
+def config() -> dict:
+    return {
+        "gemini": bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")),
+        "deepseek": bool(os.environ.get("DEEPSEEK_API_KEY")),
+        "max_upload_mb": MAX_UPLOAD_BYTES // 1024 // 1024,
+    }
+
+
+@app.post("/api/jobs")
+async def create_job(
+    file: UploadFile = File(...),
+    mode: str = Form("extract"),
+    page_range: str = Form("all"),
+    ocr_setting: str = Form("auto"),
+    target: str = Form("zh"),
+    translation_provider: str = Form("gemini"),
+    quality: str = Form("economy"),
+    translation_output: str = Form("translation"),
+    output_formats: str = Form("md,docx"),
+) -> dict:
+    _cleanup_expired_jobs()
+    filename = Path(file.filename or "document").name
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".pdf", ".txt", ".md"}:
+        raise HTTPException(400, "Only PDF, TXT, and Markdown files are supported.")
+    if mode not in {"extract", "translate"}:
+        raise HTTPException(400, "Invalid task mode.")
+    if ocr_setting not in {"auto", "always", "never"}:
+        raise HTTPException(400, "Invalid OCR setting.")
+    if target not in {"zh", "en"} or quality not in {"economy", "quality"}:
+        raise HTTPException(400, "Invalid translation target or quality setting.")
+    if translation_provider not in {"gemini", "deepseek"}:
+        raise HTTPException(400, "Invalid translation provider.")
+    if translation_provider == "deepseek" and not os.environ.get("DEEPSEEK_API_KEY"):
+        raise HTTPException(400, "DeepSeek is not configured on this server.")
+    if translation_output not in {"translation", "bilingual"}:
+        raise HTTPException(400, "Invalid translation output setting.")
+    formats = {item.strip() for item in output_formats.split(",") if item.strip()}
+    if not formats or not formats.issubset({"md", "docx"}):
+        raise HTTPException(400, "Choose Markdown, Word, or both.")
 
     job_id = uuid.uuid4().hex
     work_root = Path(tempfile.mkdtemp(prefix=f"cjkocr_{job_id}_"))
-    suffix = ".pdf" if file_type == "pdf" else ".txt"
     file_path = work_root / f"input{suffix}"
-    with file_path.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
+    size = 0
+    try:
+        with file_path.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, f"File exceeds the {MAX_UPLOAD_BYTES // 1024 // 1024} MB limit.")
+                output.write(chunk)
+        if suffix == ".pdf":
+            with file_path.open("rb") as uploaded_pdf:
+                if uploaded_pdf.read(5) != b"%PDF-":
+                    raise HTTPException(400, "The uploaded file is not a valid PDF.")
+    except Exception:
+        shutil.rmtree(work_root, ignore_errors=True)
+        raise
 
+    job = {
+        "id": job_id,
+        "created_at": time.time(),
+        "work_root": str(work_root),
+        "file_path": str(file_path),
+        "filename": filename,
+        "file_type": suffix.lstrip("."),
+        "mode": mode,
+        "page_range": page_range,
+        "ocr_setting": ocr_setting if suffix == ".pdf" else "never",
+        "target": target,
+        "translation_provider": translation_provider,
+        "quality": quality,
+        "translation_output": translation_output,
+        "output_formats": formats,
+        "status": "queued",
+        "stage": "queued",
+        "error": None,
+        "document_pages": 0,
+        "selected_pages": [],
+        "total_pages": 0,
+        "done_pages": 0,
+        "current_page": 0,
+        "preview_text": "",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "estimated_cost_usd": 0.0,
+        "models": [],
+        "outputs": {},
+    }
     with _jobs_lock:
-        _jobs[job_id] = {
-            "id": job_id,
-            "status": "queued",
-            "stage": "queued",
-            "file_type": file_type,
-            "ocr_enabled": ocr_flag,
-            "translate": translate,
-            "filename": file.filename or f"document{suffix}",
-            "total_pages": 0,
-            "done_pages": 0,
-            "total_chars": 0,
-            "done_chars": 0,
-            "preview_text": "",
-            "output_path": None,
-            "error": None,
-        }
-
-    t = threading.Thread(
-        target=_run_pipeline,
-        args=(job_id, file_path, work_root, file_type, ocr_flag, translate),
-        daemon=True,
-    )
-    t.start()
+        _jobs[job_id] = job
+    _executor.submit(_run_pipeline, job_id)
     return {"job_id": job_id}
 
 
 @app.get("/api/jobs/{job_id}")
-def get_job(job_id: str):
+def get_job(job_id: str) -> dict:
     with _jobs_lock:
-        j = _jobs.get(job_id)
-    if not j:
-        raise HTTPException(status_code=404, detail="Job not found.")
-    return {
-        "job_id": j["id"],
-        "status": j["status"],
-        "stage": j["stage"],
-        "filename": j["filename"],
-        "total_pages": j["total_pages"],
-        "done_pages": j["done_pages"],
-        "total_chars": j["total_chars"],
-        "done_chars": j["done_chars"],
-        "preview_text": j["preview_text"],
-        "error": j["error"],
-    }
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found.")
+        response = {
+            key: job[key]
+            for key in (
+                "status", "stage", "error", "document_pages", "selected_pages",
+                "total_pages", "done_pages", "current_page", "preview_text",
+                "input_tokens", "output_tokens", "estimated_cost_usd", "models",
+            )
+        }
+        response["outputs"] = {fmt: True for fmt in job["outputs"]}
+        return response
 
 
-@app.get("/api/jobs/{job_id}/download")
-def download(job_id: str, background_tasks: BackgroundTasks):
+@app.get("/api/jobs/{job_id}/download/{fmt}")
+def download(job_id: str, fmt: str):
+    if fmt not in {"md", "docx"}:
+        raise HTTPException(400, "Invalid output format.")
     with _jobs_lock:
-        j = _jobs.get(job_id)
-    if not j:
-        raise HTTPException(status_code=404, detail="Job not found.")
-    if j["status"] != "done" or not j["output_path"]:
-        raise HTTPException(status_code=400, detail="Job not complete.")
-    p = Path(j["output_path"])
-    if not p.is_file():
-        raise HTTPException(status_code=404, detail="Output missing.")
-    work_root = p.parent
-    stem = Path(j["filename"]).stem or "output"
-    background_tasks.add_task(shutil.rmtree, work_root, ignore_errors=True)
-    return FileResponse(p.as_posix(), media_type="text/plain; charset=utf-8", filename=f"{stem}.txt")
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found.")
+        output = job["outputs"].get(fmt)
+        filename = job["filename"]
+    if job["status"] != "done" or not output:
+        raise HTTPException(400, "Output is not ready.")
+    path = Path(output)
+    if not path.is_file():
+        raise HTTPException(404, "Output file has expired.")
+    media_type = "text/markdown; charset=utf-8" if fmt == "md" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    return FileResponse(path, media_type=media_type, filename=f"{Path(filename).stem}.{fmt}")
 
 
-def main():
+def main() -> None:
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8765, reload=False)
+
+    uvicorn.run(
+        "app:app",
+        host=os.environ.get("APP_HOST", "127.0.0.1"),
+        port=int(os.environ.get("APP_PORT", "8765")),
+        reload=False,
+    )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,27 @@
+[Unit]
+Description=Yomu CJK OCR and translation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yomu
+Group=yomu
+WorkingDirectory=/opt/yomu
+EnvironmentFile=/opt/yomu/.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/yomu/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# Conservative sandboxing; the app still needs /tmp for job files.
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/tmp
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

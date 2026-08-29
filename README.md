@@ -1,122 +1,82 @@
-# CJK Document → Clean Text
+# Yomu — Chinese/Japanese OCR & Translation
 
-A local web app that extracts and optionally translates Japanese and Chinese documents (PDF or TXT) using Google Gemini Vision.
+Yomu is a small private web app for two document workflows:
 
-![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue) ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-green) ![Gemini](https://img.shields.io/badge/Gemini-2.5--flash-orange)
+1. Extract Chinese or Japanese text from PDF, TXT, or Markdown and export Markdown, Word, or both.
+2. Translate Japanese documents into Traditional Chinese or English, with translation-only or bilingual output.
 
----
+## What it does
 
-## Features
+- Select all PDF pages or ranges such as `1-5, 8, 12-18`. TXT and Markdown files are processed as a whole document.
+- For PDFs, automatically use embedded text when available and OCR only scanned pages.
+- Choose OCR behavior per job: automatic, always OCR, or never OCR.
+- Process PDF pages sequentially to keep memory use bounded on a small VPS.
+- Use Gemini Flash-Lite for economy mode and Gemini Flash for quality mode.
+- Optionally use DeepSeek V4 Flash for Japanese translation when `DEEPSEEK_API_KEY` is configured; OCR remains on Gemini.
+- Report input/output tokens and an estimated API cost.
+- Export structured `.md` and styled `.docx` files.
+- Limit upload size, worker concurrency, and temporary-file lifetime.
 
-- **OCR** scanned Japanese, Korean, and Chinese PDFs via Gemini Vision (handles vertical text, furigana, bopomofo)
-- **Direct text extraction** from machine-readable PDFs (no OCR needed)
-- **TXT file support** — feed in pre-extracted text and go straight to translation
-- **Translation** to English or Traditional Chinese, powered by the same Gemini API
-- **Context-aware UI** — the OCR toggle only appears for PDFs; TXT files skip straight to translation
-- **Real-time progress** — page counter during OCR, character counter during translation
-- **Automatic retries** on transient API errors (429 rate limits, 503 overload)
-- Output is a clean `.txt` file; if translation was requested, the original and translation are both included
+The prompts are tuned for Chinese and Japanese documents. Korean is not currently a target language.
 
----
+## Local setup
 
-## Requirements
-
-### API key
-
-This tool uses the **Google Gemini API**. You must provide your own key.
-
-1. Go to [Google AI Studio](https://aistudio.google.com/) and create an API key
-2. Enable billing on your Google Cloud project (the free tier quota is very limited)
-3. Create a `.env` file in the project root:
-
-```
-GOOGLE_API_KEY=your_key_here
-```
-
-> The `.env` file is listed in `.gitignore` and will never be committed. Keep it out of version control.
-
-### System dependencies
-
-**Poppler** is required to rasterize PDF pages for OCR:
+Requirements: Python 3.11+, Poppler, and a Gemini API key.
 
 ```bash
-# macOS
 brew install poppler
-
-# Ubuntu / Debian
-sudo apt install poppler-utils
-```
-
-### Python
-
-Python 3.11 or newer is recommended.
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/czwsh98/cjk-ocr-tool.git
-cd cjk-ocr-tool
-
-# Create and activate a virtual environment (recommended)
-python3 -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-
-# Install dependencies
+python3.11 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-
-# Add your API key
-echo 'GOOGLE_API_KEY=your_key_here' > .env
-```
-
----
-
-## Usage
-
-```bash
+cp .env.example .env
+# Add GOOGLE_API_KEY to .env
 python app.py
 ```
 
-Open **http://localhost:8765** in your browser.
+Open <http://127.0.0.1:8765>.
 
-### Workflow
+## Configuration
 
-1. **Drop a file** — PDF or TXT
-2. **Configure:**
-   - PDF: toggle **Enable OCR** on (scanned) or off (machine-readable text)
-   - Choose a translation target: *No Translation*, *→ English*, or *→ Chinese*
-3. Click **Process →**
-4. Watch the progress bar — pages during OCR, characters during translation
-5. Click **Download output.txt** when done
+See [`.env.example`](.env.example). The most important variables are:
 
-### Output format
+| Variable | Purpose |
+|---|---|
+| `GOOGLE_API_KEY` | Required for Gemini OCR and translation |
+| `DEEPSEEK_API_KEY` | Optional; enables DeepSeek translation |
+| `MAX_UPLOAD_MB` | Upload limit, default 50 MB |
+| `MAX_WORKERS` | Concurrent jobs, default 2 |
+| `JOB_TTL_HOURS` | Temporary-output lifetime, default 6 hours |
 
-| Mode | Output |
-|------|--------|
-| OCR only | Extracted text |
-| OCR + translate | Original + translation, separated by headers |
-| TXT + translate | Original + translation, separated by headers |
+The app listens on `127.0.0.1` by default. Keep it private behind a reverse proxy or Cloudflare Tunnel rather than binding it directly to a public interface.
 
----
+## Tests
 
-## Environment variables
+```bash
+python -m pytest -q -p no:rerunfailures
+```
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `GOOGLE_API_KEY` | Yes | Google Gemini API key |
-| `GEMINI_VISION_MODEL` | No | Override model (default: `gemini-2.5-flash`) |
+The `no:rerunfailures` flag avoids an unrelated globally installed pytest plugin on the original development Mac.
 
----
+## Deployment
 
-## Dependencies
+The production service template is in [`deploy/yomu.service`](deploy/yomu.service). It expects the project and virtual environment under `/opt/yomu`, listens on `127.0.0.1:8765`, and can be published through Cloudflare Tunnel without taking over ports 80 or 443.
 
-| Package | Purpose |
-|---------|---------|
-| `fastapi` + `uvicorn` | Web server |
-| `pdf2image` | Rasterize PDF pages for OCR (requires Poppler) |
-| `pymupdf` | Extract text from machine-readable PDFs |
-| `Pillow` | Image handling |
-| `google-genai` | Gemini Vision OCR and translation |
-| `python-dotenv` | Load `.env` file |
-| `python-multipart` | File upload parsing |
+The current instance runs on a dedicated VPS with:
+
+- `yomu.service` managed by systemd and bound only to localhost.
+- A remotely managed Cloudflare Tunnel named `yomu-ocr`.
+- Public hostname: <https://ocr.ziwei-chen.com>.
+- Cloudflare Access in front of the hostname; access is restricted by an email allow policy.
+
+For a new host, install the system packages and Python dependencies, copy `.env.example` to `/opt/yomu/.env`, install the service template, and connect the host from the Cloudflare Zero Trust dashboard. Keep tunnel tokens and API keys out of Git; the example files intentionally contain placeholders only.
+
+```bash
+sudo apt install poppler-utils python3-venv
+python3 -m venv /opt/yomu/.venv
+/opt/yomu/.venv/bin/pip install -r /opt/yomu/requirements.txt
+sudo install -m 0644 deploy/yomu.service /etc/systemd/system/yomu.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now yomu.service
+```
+
+When exposing the service publicly, put Cloudflare Access in front of the tunnel and create an explicit allow policy. Do not publish the app directly on a public interface.
