@@ -9,7 +9,7 @@ Yomu is a small private web app for two document workflows:
 
 - Select all PDF pages or ranges such as `1-5, 8, 12-18`. TXT and Markdown files are processed as a whole document.
 - For PDFs, automatically use embedded text when available and OCR only scanned pages.
-- Choose OCR behavior per job: automatic, always OCR, or never OCR.
+- OCR every PDF page by default; "never OCR" is available to trust a PDF's own text layer instead, for genuinely born-digital files. There is no character-count auto-detection: many scanned CJK PDFs (Anna's Archive and similar library scans especially) carry a legacy OCR text layer from a tool that read a traditional vertical right-to-left layout one glyph at a time, producing a layer that is long enough to look complete while having a scrambled reading order and mostly wrong characters — length alone can't tell that apart from a good layer.
 - Process PDF pages sequentially to keep memory use bounded on a small VPS.
 - Use Gemini 3.1 Flash-Lite for economy mode; quality mode uses 3.5 Flash-Lite for OCR and 3.7 Flash for translation.
 - Prefer DeepSeek V4 Flash for translation whenever `DEEPSEEK_API_KEY` is set. It is the default in that case because it benchmarked both cheaper and more faithful than every Gemini tier. OCR always stays on Gemini.

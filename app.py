@@ -32,7 +32,6 @@ load_dotenv()
 
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "50")) * 1024 * 1024
 JOB_TTL_SECONDS = int(os.environ.get("JOB_TTL_HOURS", "6")) * 3600
-TEXT_THRESHOLD = int(os.environ.get("PDF_TEXT_THRESHOLD", "80"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))
 TRANSLATION_CHUNK_CHARS = max(1000, int(os.environ.get("TRANSLATION_CHUNK_CHARS", "12000")))
 WORK_PREFIX = "cjkocr_"
@@ -221,14 +220,17 @@ def _extract_page(
     ocr_setting: str,
     quality: str,
 ) -> str:
-    native_text = ""
-    if ocr_setting != "always":
-        native_text = extract_pdf_page_text(file_path, page_number)
-    should_ocr = ocr_setting == "always" or (
-        ocr_setting == "auto" and len(native_text.strip()) < TEXT_THRESHOLD
-    )
-    if not should_ocr:
-        return native_text
+    # No character-count heuristic decides this anymore. A PDF's embedded
+    # text layer is only trusted when the caller explicitly says "never
+    # OCR" — plenty of scanned CJK PDFs (Anna's Archive and similar library
+    # scans especially) carry a legacy OCR layer that reads a traditional
+    # vertical right-to-left column layout one glyph at a time, producing a
+    # text layer that is long enough to pass any length threshold while
+    # being unusable: reading order scrambled, most characters wrong. A
+    # threshold on character count can't tell that text apart from a good
+    # embedded layer, so it isn't a safe way to decide whether to OCR.
+    if ocr_setting == "never":
+        return extract_pdf_page_text(file_path, page_number)
 
     page_dir = work_root / "page_image"
     image_path = pdf_page_to_image(file_path, page_dir, page_number)
@@ -401,7 +403,7 @@ INDEX_HTML = r"""<!doctype html>
         <span class="label">3 · 处理范围</span>
         <div class="grid">
           <div class="field pdf-only" id="rangeField"><label for="pageRange">页码范围</label><input id="pageRange" type="text" value="all" placeholder="all 或 1-5, 8, 12-18"><small>只处理指定页面，减少时间与 API 费用。</small></div>
-          <div class="field pdf-only" id="ocrField"><label for="ocrSetting">PDF 文字识别</label><select id="ocrSetting"><option value="auto">自动：优先读取已有文字</option><option value="always">始终使用 OCR</option><option value="never">永不 OCR</option></select><small>自动模式只对没有足够文本的扫描页调用 Vision API。</small></div>
+          <div class="field pdf-only" id="ocrField"><label for="ocrSetting">PDF 文字识别</label><select id="ocrSetting"><option value="always" selected>使用 OCR（推荐）</option><option value="never">从不：仅用 PDF 中已有文字</option></select><small>许多扫描版 PDF（尤其是老书）自带的文字层是竖排版损坏后的旧 OCR 结果，看起来字数够但读音乱、字都错，无法用字数判断好坏，因此默认总是用 Vision OCR。仅当你确定文件是原生文字（非扫描）时才选“仅用已有文字”以节省费用。</small></div>
           <div class="field"><label>质量</label><div class="choices"><label class="choice"><input type="radio" name="quality" value="economy" checked><span>经济</span></label><label class="choice"><input type="radio" name="quality" value="quality"><span>高质量</span></label></div><small>OCR：经济使用 Gemini 3.1 Flash-Lite，高质量使用 3.5 Flash-Lite。翻译：已配置 DeepSeek 时始终使用 DeepSeek V4 Flash（质量档不影响），否则经济用 Gemini 3.1 Flash-Lite、高质量用 3.7 Flash。</small></div>
           <div class="field translation-only" id="targetField"><label>翻译为</label><div class="choices"><label class="choice"><input type="radio" name="target" value="zh" checked><span>简体中文</span></label><label class="choice"><input type="radio" name="target" value="en"><span>English</span></label></div></div>
           <div class="field translation-only" id="providerField"><label for="provider">翻译服务</label><select id="provider"><option value="gemini">Gemini</option></select><small id="providerHelp">按服务器已配置的 API 显示。</small></div>
@@ -484,7 +486,7 @@ async def create_job(
     file: UploadFile = File(...),
     mode: str = Form("extract"),
     page_range: str = Form("all"),
-    ocr_setting: str = Form("auto"),
+    ocr_setting: str = Form("always"),
     target: str = Form("zh"),
     translation_provider: str = Form(""),
     quality: str = Form("economy"),
@@ -498,7 +500,13 @@ async def create_job(
         raise HTTPException(400, "Only PDF, TXT, and Markdown files are supported.")
     if mode not in {"extract", "translate"}:
         raise HTTPException(400, "Invalid task mode.")
-    if ocr_setting not in {"auto", "always", "never"}:
+    # "auto" is accepted as a synonym for "always": it used to skip OCR when
+    # a PDF's embedded text layer looked long enough, a heuristic dropped
+    # because that layer is often a scrambled legacy OCR pass rather than
+    # real content (see _extract_page).
+    if ocr_setting == "auto":
+        ocr_setting = "always"
+    if ocr_setting not in {"always", "never"}:
         raise HTTPException(400, "Invalid OCR setting.")
     if target not in {"zh", "en"} or quality not in {"economy", "quality"}:
         raise HTTPException(400, "Invalid translation target or quality setting.")
