@@ -27,17 +27,26 @@ def write_markdown(
     include_source: bool,
     include_translation: bool,
     target_label: str = "",
+    document_translation: str = "",
 ) -> None:
     lines = [f"# {_clean_title(filename)}", ""]
-    for result in pages:
-        lines.extend([f"## Page {result.page}", ""])
-        if include_source:
-            if include_translation:
-                lines.extend(["### Original", ""])
+    if include_source:
+        if include_translation:
+            lines.extend(["## Original", ""])
+        for result in pages:
+            lines.extend([f"## Page {result.page}", ""])
             lines.extend([result.source.strip(), ""])
-        if include_translation and result.translation.strip():
-            lines.extend([f"### Translation{f' — {target_label}' if target_label else ''}", ""])
-            lines.extend([result.translation.strip(), ""])
+
+    if include_translation:
+        lines.extend([f"## Translation{f' — {target_label}' if target_label else ''}", ""])
+        if document_translation.strip():
+            lines.extend([document_translation.strip(), ""])
+        else:
+            # Preserve the old PageResult-based API for callers that do not
+            # provide a document-level translation.
+            for result in pages:
+                if result.translation.strip():
+                    lines.extend([result.translation.strip(), ""])
     output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
@@ -66,6 +75,7 @@ def write_docx(
     include_source: bool,
     include_translation: bool,
     target_label: str = "",
+    document_translation: str = "",
 ) -> None:
     document = Document()
     section = document.sections[0]
@@ -77,26 +87,30 @@ def write_docx(
     title = document.add_heading(level=0)
     _set_run_font(title.add_run(_clean_title(filename)), size=20, bold=True, color="9D2C21")
 
-    for index, result in enumerate(pages):
-        page_heading = document.add_heading(level=1)
-        _set_run_font(page_heading.add_run(f"Page {result.page}"), size=14, bold=True)
-
-        if include_source:
-            if include_translation:
-                heading = document.add_heading(level=2)
-                _set_run_font(heading.add_run("Original"), size=11, bold=True, color="9D2C21")
+    if include_source:
+        if include_translation:
+            heading = document.add_heading(level=1)
+            _set_run_font(heading.add_run("Original"), size=14, bold=True, color="9D2C21")
+        for result in pages:
+            page_heading = document.add_heading(level=2 if include_translation else 1)
+            _set_run_font(
+                page_heading.add_run(f"Page {result.page}"),
+                size=12 if include_translation else 14,
+                bold=True,
+            )
             _add_text_blocks(document, result.source)
 
-        if include_translation and result.translation.strip():
-            heading = document.add_heading(level=2)
-            label = f"Translation — {target_label}" if target_label else "Translation"
-            _set_run_font(heading.add_run(label), size=11, bold=True, color="9D2C21")
-            _add_text_blocks(document, result.translation)
-
-        if index < len(pages) - 1:
-            spacer = document.add_paragraph()
-            spacer.paragraph_format.space_before = Pt(8)
-            spacer.paragraph_format.space_after = Pt(8)
-            _set_run_font(spacer.add_run("—"), color="D9CFC1")
+    if include_translation:
+        heading = document.add_heading(level=1)
+        label = f"Translation — {target_label}" if target_label else "Translation"
+        _set_run_font(heading.add_run(label), size=14, bold=True, color="9D2C21")
+        if document_translation.strip():
+            _add_text_blocks(document, document_translation)
+        else:
+            # Preserve the old PageResult-based API for callers that do not
+            # provide a document-level translation.
+            for result in pages:
+                if result.translation.strip():
+                    _add_text_blocks(document, result.translation)
 
     document.save(output_path)

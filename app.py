@@ -294,26 +294,44 @@ def _run_pipeline(job_id: str) -> None:
                 preview_text="\n\n".join(p.source for p in pages)[-6000:],
             )
 
+        document_translation = ""
         if job["mode"] == "translate":
-            _job_update(job_id, stage="translating", done_pages=0)
-            for index, page in enumerate(pages, start=1):
-                _job_update(job_id, stage=f"translating_page_{page.page}", current_page=page.page)
-                translations: list[str] = []
-                for chunk in _translation_chunks(page.source):
-                    result = translate_text(
-                        chunk,
-                        job["target"],
-                        provider=job["translation_provider"],
-                        quality=job["quality"],
-                    )
-                    _record_usage(job_id, result)
-                    translations.append(postprocess_translation_ready_text(result.text).strip())
-                page.translation = "\n\n".join(item for item in translations if item)
+            # OCR/extraction must finish for every selected page before the
+            # translator sees any text. Translating page by page loses
+            # document-level context and produces an alternating original /
+            # translation export. Keep page boundaries in the source export,
+            # but send one complete document to the translator (split only
+            # when the provider input limit requires it).
+            complete_source = "\n\n".join(page.source.strip() for page in pages if page.source.strip())
+            translation_chunks = _translation_chunks(complete_source)
+            _job_update(
+                job_id,
+                stage="translating_document",
+                done_pages=0,
+                translation_chunks=len(translation_chunks),
+            )
+            translations: list[str] = []
+            for index, chunk in enumerate(translation_chunks, start=1):
                 _job_update(
                     job_id,
-                    done_pages=index,
-                    preview_text="\n\n".join(p.translation for p in pages if p.translation)[-6000:],
+                    stage=f"translating_part_{index}_of_{len(translation_chunks)}",
+                    current_page=pages[-1].page,
                 )
+                result = translate_text(
+                    chunk,
+                    job["target"],
+                    provider=job["translation_provider"],
+                    quality=job["quality"],
+                )
+                _record_usage(job_id, result)
+                translated = postprocess_translation_ready_text(result.text).strip()
+                if translated:
+                    translations.append(translated)
+                _job_update(
+                    job_id,
+                    preview_text="\n\n".join(translations)[-6000:],
+                )
+            document_translation = "\n\n".join(translations)
 
         target_label = "Simplified Chinese" if job["target"] == "zh" else "English"
         include_translation = job["mode"] == "translate"
@@ -330,6 +348,7 @@ def _run_pipeline(job_id: str) -> None:
                 include_source=include_source,
                 include_translation=include_translation,
                 target_label=target_label,
+                document_translation=document_translation,
             )
             outputs["md"] = str(md_path)
         if "docx" in job["output_formats"]:
@@ -341,6 +360,7 @@ def _run_pipeline(job_id: str) -> None:
                 include_source=include_source,
                 include_translation=include_translation,
                 target_label=target_label,
+                document_translation=document_translation,
             )
             outputs["docx"] = str(docx_path)
 
@@ -429,7 +449,7 @@ fileInput.onchange=()=>fileInput.files[0]&&useFile(fileInput.files[0]);drop.ondr
 
 function checked(name){return document.querySelector(`input[name="${name}"]:checked`)?.value}
 function showError(message){errorBox.textContent=message;errorBox.classList.add('show')}
-function stageLabel(stage){if(stage==='queued')return'排队等待中';if(stage==='preparing')return'正在检查文件';if(stage==='extracting')return'开始提取文字';if(stage.startsWith('extracting_page_'))return`正在提取第 ${stage.split('_').pop()} 页`;if(stage==='translating')return'开始翻译';if(stage.startsWith('translating_page_'))return`正在翻译第 ${stage.split('_').pop()} 页`;if(stage==='done')return'处理完成';return stage||'等待中'}
+function stageLabel(stage){if(stage==='queued')return'排队等待中';if(stage==='preparing')return'正在检查文件';if(stage==='extracting')return'开始提取文字';if(stage.startsWith('extracting_page_'))return`正在提取第 ${stage.split('_').pop()} 页`;if(stage==='translating')return'开始翻译';if(stage==='translating_document')return'准备翻译完整原文';if(stage.startsWith('translating_part_'))return`正在翻译完整原文（${stage.slice('translating_part_'.length).replace('_of_',' / ')}）`;if(stage.startsWith('translating_page_'))return`正在翻译第 ${stage.split('_').pop()} 页`;if(stage==='done')return'处理完成';return stage||'等待中'}
 
 async function loadConfig(){try{const r=await fetch('/api/config');const c=await r.json();if(c.deepseek){const o=document.createElement('option');o.value='deepseek';o.textContent='DeepSeek V4 Flash';$('#provider').prepend(o);$('#providerHelp').textContent='DeepSeek 更便宜且译文更忠实，默认使用。'}else{$('#providerHelp').textContent='未配置 DeepSeek key，目前使用 Gemini。'}if(c.default_translation_provider)$('#provider').value=c.default_translation_provider}catch{}}
 loadConfig();

@@ -106,6 +106,58 @@ def test_long_translation_is_chunked(monkeypatch):
     assert all(len(chunk) <= 20 for chunk in chunks)
 
 
+def test_translation_uses_complete_source_before_exporting_translation(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "pages.pdf"
+    document = pymupdf.open()
+    document.new_page()
+    document.new_page()
+    document.save(pdf_path)
+    document.close()
+
+    def fake_extract_page_text(file_path, page_number):
+        return "第一页面原文。" if page_number == 1 else "第二页面原文。"
+
+    monkeypatch.setattr(app, "extract_pdf_page_text", fake_extract_page_text)
+
+    calls = []
+
+    def fake_translate(text, target, *, provider, quality):
+        calls.append(text)
+        return ModelResult(
+            text="完整译文：" + text,
+            provider="gemini",
+            model="custom-model",
+            input_tokens=1,
+            output_tokens=1,
+        )
+
+    monkeypatch.setattr(app, "translate_text", fake_translate)
+    response = client.post(
+        "/api/jobs",
+        files={"file": ("pages.pdf", pdf_path.read_bytes(), "application/pdf")},
+        data={
+            "mode": "translate",
+            "ocr_setting": "never",
+            "translation_output": "bilingual",
+            "output_formats": "md",
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    try:
+        result = _wait(job_id)
+        assert result["status"] == "done", result.get("error")
+        assert len(calls) == 1
+        assert calls[0].index("第一页面原文") < calls[0].index("第二页面原文")
+
+        markdown = client.get(f"/api/jobs/{job_id}/download/md").text
+        assert markdown.index("第一页面原文") < markdown.index("第二页面原文")
+        assert markdown.index("第二页面原文") < markdown.index("## Translation")
+        assert markdown.index("## Translation") < markdown.index("完整译文")
+    finally:
+        _cleanup(job_id)
+
+
 def test_default_and_auto_and_always_all_ocr_even_with_long_native_text(monkeypatch, tmp_path):
     """
     A PDF's embedded text layer is never trusted just for being long — a

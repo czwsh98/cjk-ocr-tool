@@ -16,6 +16,7 @@ Yomu is a small private web app for two document workflows:
 - Report an explicit "cost estimate unavailable" instead of `$0.0000` when a configured model has no published price.
 - Report input/output tokens and an estimated API cost.
 - Split long translation inputs at paragraph boundaries to avoid silent output truncation.
+- Finish OCR for the selected pages before translating the complete extracted document; bilingual exports place all original text before all translated text.
 - Reject blocked, truncated, or empty model responses instead of exporting blank pages.
 - Export structured `.md` and styled `.docx` files.
 - Limit upload size, worker concurrency, and temporary-file lifetime.
