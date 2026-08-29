@@ -3,7 +3,7 @@
 Yomu is a small private web app for two document workflows:
 
 1. Extract Chinese or Japanese text from PDF, TXT, or Markdown and export Markdown, Word, or both.
-2. Translate Japanese documents into Traditional Chinese or English, with translation-only or bilingual output.
+2. Translate Japanese documents into Simplified Chinese or English, with translation-only or bilingual output.
 
 ## What it does
 

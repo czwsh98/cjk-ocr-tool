@@ -313,7 +313,7 @@ def _run_pipeline(job_id: str) -> None:
                     preview_text="\n\n".join(p.translation for p in pages if p.translation)[-6000:],
                 )
 
-        target_label = "Traditional Chinese" if job["target"] == "zh" else "English"
+        target_label = "Simplified Chinese" if job["target"] == "zh" else "English"
         include_translation = job["mode"] == "translate"
         include_source = not include_translation or job["translation_output"] == "bilingual"
         stem = Path(job["filename"]).stem or "document"
@@ -388,7 +388,7 @@ INDEX_HTML = r"""<!doctype html>
       <span class="label">1 · 选择任务</span>
       <div class="modes">
         <button class="mode active" data-mode="extract"><b>提取文字</b><small>OCR 或直接提取 → Markdown / Word</small></button>
-        <button class="mode" data-mode="translate"><b>日文翻译</b><small>日文 → 繁体中文或英文</small></button>
+        <button class="mode" data-mode="translate"><b>日文翻译</b><small>日文 → 简体中文或英文</small></button>
       </div>
     </section>
     <section class="section">
@@ -402,8 +402,8 @@ INDEX_HTML = r"""<!doctype html>
         <div class="grid">
           <div class="field pdf-only" id="rangeField"><label for="pageRange">页码范围</label><input id="pageRange" type="text" value="all" placeholder="all 或 1-5, 8, 12-18"><small>只处理指定页面，减少时间与 API 费用。</small></div>
           <div class="field pdf-only" id="ocrField"><label for="ocrSetting">PDF 文字识别</label><select id="ocrSetting"><option value="auto">自动：优先读取已有文字</option><option value="always">始终使用 OCR</option><option value="never">永不 OCR</option></select><small>自动模式只对没有足够文本的扫描页调用 Vision API。</small></div>
-          <div class="field"><label>质量</label><div class="choices"><label class="choice"><input type="radio" name="quality" value="economy" checked><span>经济</span></label><label class="choice"><input type="radio" name="quality" value="quality"><span>高质量</span></label></div><small>经济使用 Gemini 3.1 Flash-Lite；高质量 OCR 使用 3.5 Flash-Lite，翻译使用 3.7 Flash。</small></div>
-          <div class="field translation-only" id="targetField"><label>翻译为</label><div class="choices"><label class="choice"><input type="radio" name="target" value="zh" checked><span>繁体中文</span></label><label class="choice"><input type="radio" name="target" value="en"><span>English</span></label></div></div>
+          <div class="field"><label>质量</label><div class="choices"><label class="choice"><input type="radio" name="quality" value="economy" checked><span>经济</span></label><label class="choice"><input type="radio" name="quality" value="quality"><span>高质量</span></label></div><small>OCR：经济使用 Gemini 3.1 Flash-Lite，高质量使用 3.5 Flash-Lite。翻译：已配置 DeepSeek 时始终使用 DeepSeek V4 Flash（质量档不影响），否则经济用 Gemini 3.1 Flash-Lite、高质量用 3.7 Flash。</small></div>
+          <div class="field translation-only" id="targetField"><label>翻译为</label><div class="choices"><label class="choice"><input type="radio" name="target" value="zh" checked><span>简体中文</span></label><label class="choice"><input type="radio" name="target" value="en"><span>English</span></label></div></div>
           <div class="field translation-only" id="providerField"><label for="provider">翻译服务</label><select id="provider"><option value="gemini">Gemini</option></select><small id="providerHelp">按服务器已配置的 API 显示。</small></div>
           <div class="field translation-only" id="translationOutputField"><label>翻译输出</label><div class="choices"><label class="choice"><input type="radio" name="translationOutput" value="translation" checked><span>仅译文</span></label><label class="choice"><input type="radio" name="translationOutput" value="bilingual"><span>原文＋译文</span></label></div></div>
           <div class="field"><label>导出格式</label><div class="choices"><label class="choice"><input type="checkbox" name="format" value="md" checked><span>Markdown</span></label><label class="choice"><input type="checkbox" name="format" value="docx" checked><span>Word</span></label></div></div>

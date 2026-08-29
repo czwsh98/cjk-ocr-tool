@@ -35,14 +35,14 @@ Rules:
 Text to translate:
 """
 
-TRANSLATE_PROMPT_ZH = """你是一位專業的中日翻譯。請將以下文字翻譯成繁體中文。
+TRANSLATE_PROMPT_ZH = """你是一位专业的中日翻译。请将以下文字翻译成简体中文。
 
-規則：
-1. 只輸出譯文，不加任何說明、標籤或 Markdown。
+规则：
+1. 只输出译文，不加任何说明、标签或 Markdown。
 2. 保留原文的段落分隔（空行）。
-3. 忠實翻譯原意，不省略任何內容。
+3. 忠实翻译原意，不省略任何内容。
 
-待翻譯文字：
+待翻译文字：
 """
 
 
@@ -296,9 +296,9 @@ def default_translation_provider() -> str:
     """
     DeepSeek when configured, else Gemini.
 
-    On a Japanese->Traditional Chinese benchmark deepseek-v4-flash was both the
-    cheapest option tested ($0.000098 vs $0.000207 for gemini-3.1-flash-lite)
-    and the most faithful, so it is preferred whenever a key is present.
+    On a Japanese->Chinese benchmark deepseek-v4-flash was both the cheapest
+    option tested ($0.000098 vs $0.000207 for gemini-3.1-flash-lite) and the
+    most faithful, so it is preferred whenever a key is present.
     """
     if os.environ.get("DEEPSEEK_API_KEY"):
         return "deepseek"
@@ -312,7 +312,7 @@ def translate_text(
     provider: str | None = None,
     quality: str = "economy",
 ) -> ModelResult:
-    """Translate Japanese text to English or Traditional Chinese."""
+    """Translate Japanese text to English or Simplified Chinese."""
     provider = provider or default_translation_provider()
     if not text.strip():
         return ModelResult("", provider, "")
